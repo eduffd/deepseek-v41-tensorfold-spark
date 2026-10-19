@@ -30,7 +30,8 @@ pub const Out = struct {
     vt: *const VTable,
 
     pub const VTable = struct {
-        /// 200 with text/event-stream: the stream's head, with the prepared prompt's token count (0: none).
+        /// 200 with text/event-stream: the stream's head, carrying the prepared prompt's token count. A 0 means
+        /// no prompt stands behind this head, as in a context-window refusal.
         open: *const fn (ctx: *anyopaque, prompt_len: usize) error{Closed}!void,
         /// One ``data:`` payload; null is ``[DONE]``.
         event: *const fn (ctx: *anyopaque, payload: ?Value) error{Closed}!void,

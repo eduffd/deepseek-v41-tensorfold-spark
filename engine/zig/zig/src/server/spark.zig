@@ -4,7 +4,9 @@
 //!
 //! - **Replies**: ids ``chatcmpl-`` / ``cmpl-`` and 24 hex digits; ``model`` is always the served name; ``usage``
 //!   without ``completion_tokens_details``; the engine's stats under ``tensorfold``; a stream's usage in its
-//!   last chunk, asked for by ``stream_options.include_usage`` or not.
+//!   last chunk, asked for by ``stream_options.include_usage`` or not, so that option is a no-op on this wire.
+//!   The parity reference diverges here: ``glm5_next/spark/server.py`` puts usage on a stream's last chunk only
+//!   when asked, and the five re-baselined stream bodies in ``fixtures/serve/wire.jsonl`` carry the divergence (#49).
 //! - **Errors**: ``{"error": {"message", "type", "code"?, "param"?}}``; an unknown path ``{"error": "not found"}``;
 //!   the context limit in OpenAI's and vLLM's words, which clients parse to compact.
 //! - **/health** (``Health``): ok / fatal / stalled / inflight and upstream's live totals (``drafted_total``,
