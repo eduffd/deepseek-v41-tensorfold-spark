@@ -3,8 +3,8 @@
 //! scripts written against them. ``Wire.spark`` selects it (``Config.wire``); ``Wire.tensorfold`` is upstream's.
 //!
 //! - **Replies**: ids ``chatcmpl-`` / ``cmpl-`` and 24 hex digits; ``model`` is always the served name; ``usage``
-//!   without ``completion_tokens_details``; the engine's stats under ``tensorfold``; a stream's usage only with
-//!   ``stream_options.include_usage``, inside its last chunk.
+//!   without ``completion_tokens_details``; the engine's stats under ``tensorfold``; a stream's usage in its
+//!   last chunk, asked for by ``stream_options.include_usage`` or not.
 //! - **Errors**: ``{"error": {"message", "type", "code"?, "param"?}}``; an unknown path ``{"error": "not found"}``;
 //!   the context limit in OpenAI's and vLLM's words, which clients parse to compact.
 //! - **/health** (``Health``): ok / fatal / stalled / inflight and upstream's live totals (``drafted_total``,
