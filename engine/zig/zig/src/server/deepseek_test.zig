@@ -193,6 +193,21 @@ fn delta(ev: json.Value) json.Value {
     return ev.get("choices").?.array[0].get("delta").?;
 }
 
+/// The first event whose ``type`` is ``kind``; null when the stream has no such event. The Messages and
+/// Responses wires prefix each event with an ``event:`` line, so this walks the ``data:`` lines itself.
+fn eventOfType(a: Allocator, body: []const u8, kind: []const u8) !?json.Value {
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const data = std.mem.trim(u8, line, "\r\n");
+        if (!std.mem.startsWith(u8, data, "data: ")) continue;
+        const parsed = try json.parseText(a, data[6..]);
+        if (parsed != .ok) continue; // [DONE] and any payload that is not JSON
+        const t = parsed.ok.get("type") orelse continue;
+        if (t == .string and std.mem.eql(u8, t.string, kind)) return parsed.ok;
+    }
+    return null;
+}
+
 fn check(h: *Harness, a: Allocator) !void {
     const tok = h.stub.tok;
     // 1. a whole reply: reasoning in both fields, content, usage with the engine's cached tokens
@@ -521,6 +536,39 @@ test "a streamed reply names its usage in its last chunk on both wires, asked fo
             const usage = last.get("usage") orelse return error.LastChunkHasNoUsage;
             try testing.expectEqual(@as(i64, @intCast(h.stub.last_prompt.items.len)), usage.get("prompt_tokens").?.int64().?);
             try testing.expectEqual(@as(i64, 3), usage.get("prompt_tokens_details").?.get("cached_tokens").?.int64().?);
+        }
+
+        // The Messages head names the prompt the engine billed, and equals the delta's split of it.
+        const messages = "{\"model\":\"deepseek-v41\",\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}]}";
+        const mr = try h.post(a, "/v1/messages", messages);
+        try testing.expectEqual(@as(u16, 200), mr.status);
+        const start = (try eventOfType(a, mr.body, "message_start")) orelse return error.MessagesStreamHasNoHead;
+        const msg = start.get("message") orelse return error.MessagesHeadHasNoMessage;
+        const head = msg.get("usage") orelse return error.MessagesHeadHasNoUsage;
+        const dlt = (try eventOfType(a, mr.body, "message_delta")) orelse return error.MessagesStreamHasNoDelta;
+        const split = dlt.get("usage") orelse return error.MessagesDeltaHasNoUsage;
+        const billed: i64 = @intCast(h.stub.last_prompt.items.len);
+        try testing.expectEqual(billed, (head.get("input_tokens") orelse return error.MessagesHeadHasNoInputTokens).int64().?);
+        try testing.expectEqual(@as(i64, 0), (head.get("output_tokens") orelse return error.MessagesHeadHasNoOutputTokens).int64().?);
+        const parts = (split.get("input_tokens") orelse return error.MessagesDeltaHasNoInputTokens).int64().? +
+            (split.get("cache_read_input_tokens") orelse return error.MessagesDeltaHasNoCacheRead).int64().?;
+        try testing.expectEqual(billed, parts);
+
+        // A .spark Responses stream carries the last chunk's usage into response.completed.
+        if (wire == .spark) {
+            const rr = try h.post(a, "/v1/responses", "{\"input\":\"hi @chat\",\"stream\":true}");
+            try testing.expectEqual(@as(u16, 200), rr.status);
+            const done = (try eventOfType(a, rr.body, "response.completed")) orelse return error.ResponsesStreamHasNoCompleted;
+            const resp = done.get("response") orelse return error.ResponsesCompletedHasNoResponse;
+            const use = resp.get("usage") orelse return error.ResponsesCompletedHasNoUsageField;
+            try testing.expect(use == .object);
+            const rendered: i64 = @intCast(h.stub.last_prompt.items.len); // the Responses prompt, rendered on its own
+            try testing.expectEqual(rendered, (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().?);
+            try testing.expectEqual(
+                (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().? +
+                    (use.object.get("output_tokens") orelse return error.ResponsesUsageHasNoOutputTokens).int64().?,
+                (use.object.get("total_tokens") orelse return error.ResponsesUsageHasNoTotalTokens).int64().?,
+            );
         }
     }
 }
