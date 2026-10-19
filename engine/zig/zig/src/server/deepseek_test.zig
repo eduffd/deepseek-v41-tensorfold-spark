@@ -201,7 +201,7 @@ fn eventOfType(a: Allocator, body: []const u8, kind: []const u8) !?json.Value {
         const data = std.mem.trim(u8, line, "\r\n");
         if (!std.mem.startsWith(u8, data, "data: ")) continue;
         const parsed = try json.parseText(a, data[6..]);
-        if (parsed != .ok) continue; // [DONE] and any payload that is not JSON
+        if (parsed != .ok) continue;
         const t = parsed.ok.get("type") orelse continue;
         if (t == .string and std.mem.eql(u8, t.string, kind)) return parsed.ok;
     }
@@ -532,13 +532,13 @@ test "a streamed reply names its usage in its last chunk on both wires, asked fo
             const r = try h.post(a, "/v1/chat/completions", body);
             try testing.expectEqual(@as(u16, 200), r.status);
             const evs = try events(a, r.body);
+            if (evs.len < 2) return error.StreamHasNoLastChunk;
             const last = evs[evs.len - 2] orelse return error.StreamHasNoLastChunk;
             const usage = last.get("usage") orelse return error.LastChunkHasNoUsage;
             try testing.expectEqual(@as(i64, @intCast(h.stub.last_prompt.items.len)), usage.get("prompt_tokens").?.int64().?);
             try testing.expectEqual(@as(i64, 3), usage.get("prompt_tokens_details").?.get("cached_tokens").?.int64().?);
         }
 
-        // The Messages head names the prompt the engine billed, and equals the delta's split of it.
         const messages = "{\"model\":\"deepseek-v41\",\"max_tokens\":8,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}]}";
         const mr = try h.post(a, "/v1/messages", messages);
         try testing.expectEqual(@as(u16, 200), mr.status);
@@ -554,7 +554,6 @@ test "a streamed reply names its usage in its last chunk on both wires, asked fo
             (split.get("cache_read_input_tokens") orelse return error.MessagesDeltaHasNoCacheRead).int64().?;
         try testing.expectEqual(billed, parts);
 
-        // A .spark Responses stream carries the last chunk's usage into response.completed.
         if (wire == .spark) {
             const rr = try h.post(a, "/v1/responses", "{\"input\":\"hi @chat\",\"stream\":true}");
             try testing.expectEqual(@as(u16, 200), rr.status);
@@ -562,8 +561,8 @@ test "a streamed reply names its usage in its last chunk on both wires, asked fo
             const resp = done.get("response") orelse return error.ResponsesCompletedHasNoResponse;
             const use = resp.get("usage") orelse return error.ResponsesCompletedHasNoUsageField;
             try testing.expect(use == .object);
-            const rendered: i64 = @intCast(h.stub.last_prompt.items.len); // the Responses prompt, rendered on its own
-            try testing.expectEqual(rendered, (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().?);
+            const responses_prompt_len: i64 = @intCast(h.stub.last_prompt.items.len); // rendered on its own, not the Messages prompt billed above
+            try testing.expectEqual(responses_prompt_len, (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().?);
             try testing.expectEqual(
                 (use.object.get("input_tokens") orelse return error.ResponsesUsageHasNoInputTokens).int64().? +
                     (use.object.get("output_tokens") orelse return error.ResponsesUsageHasNoOutputTokens).int64().?,

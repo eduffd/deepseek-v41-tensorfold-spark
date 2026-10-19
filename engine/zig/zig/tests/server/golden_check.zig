@@ -1,4 +1,4 @@
-//! Frozen server goldens for `zig build test-golden`, with the thirteen differences that are still known.
+//! Frozen server goldens for `zig build test-golden`, with the differences that are still known.
 const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
@@ -17,8 +17,7 @@ const known_diffs = [_]Known{
     .{ .group = "metrics-open", .name = "v1-metrics" },
     .{ .group = "keys", .name = "metrics-counted" },
     // The Anthropic stream heads carry the prompt's token count (port of upstream #672 by kky42); the frozen
-    // Python goldens predate it and open with 0, so these six bodies may differ on purpose. The list covers the
-    // wire shape only: headSplitProblem's reasons are gated, so a stream that breaks its own counting fails.
+    // Python goldens predate it and open with 0, so these six bodies may differ on purpose.
     .{ .group = "anthropic", .name = "plain-stream" },
     .{ .group = "anthropic", .name = "thinking-stream" },
     .{ .group = "anthropic", .name = "tool-use-stream" },
@@ -223,7 +222,7 @@ var outcomes: std.ArrayList(Outcome) = .empty;
 const Usage = struct { total: ?i64 = null, problem: ?[]const u8 = null };
 
 fn named(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
-    return std.fmt.allocPrint(a, "{s}" ++ fmt, .{gated_prefix} ++ args) catch "INVARIANT: the usage blob is malformed";
+    return std.fmt.allocPrint(a, "{s}" ++ fmt, .{gated_prefix} ++ args) catch gated_prefix ++ "the usage blob is malformed";
 }
 
 /// One Messages usage blob as a prompt total: input_tokens, cache_read_input_tokens, cache_creation_input_tokens.
@@ -240,19 +239,17 @@ fn usageTotal(a: std.mem.Allocator, usage: std.json.Value, kind: []const u8) Usa
     return .{ .total = total };
 }
 
-/// The usage of one Messages stream event: message_start keeps it under "message", message_delta at its top.
+/// The usage of one Messages stream event; message_start nests it under "message".
 fn eventUsage(a: std.mem.Allocator, ev: std.json.Value, kind: []const u8) Usage {
     const node = if (std.mem.eql(u8, kind, "message_start")) (ev.object.get("message") orelse .null) else ev;
     const usage = if (node == .object) (node.object.get("usage") orelse .null) else .null;
     return usageTotal(a, usage, kind);
 }
 
-/// The Anthropic streaming invariant: message_start's whole prompt equals message_delta's input plus its cache
-/// fields. A stream with a head owes the stream its delta, and an error event fails on its own. A reply with
-/// neither half (whole replies, refusals, counts) reports nothing.
-fn headSplitProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
-    var head: ?i64 = null;
-    var split: ?i64 = null;
+/// Counts a Messages stream against the Anthropic streaming invariant, naming every way its totals can break.
+fn promptCountProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    var start_total: ?i64 = null;
+    var delta_total: ?i64 = null;
     var ended = false;
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line| {
@@ -265,17 +262,22 @@ fn headSplitProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
             ended = true;
             continue;
         }
-        const where = if (std.mem.eql(u8, kind.string, "message_start")) "message_start" else if (std.mem.eql(u8, kind.string, "message_delta")) "message_delta" else continue;
-        const got = eventUsage(a, v, where);
-        if (got.problem) |p| return p;
-        if (std.mem.eql(u8, where, "message_start")) head = got.total else split = got.total;
+        if (std.mem.eql(u8, kind.string, "message_start")) {
+            const got = eventUsage(a, v, kind.string);
+            if (got.problem) |p| return p;
+            start_total = got.total;
+        } else if (std.mem.eql(u8, kind.string, "message_delta")) {
+            const got = eventUsage(a, v, kind.string);
+            if (got.problem) |p| return p;
+            delta_total = got.total;
+        }
     }
-    if (head == null and split == null) return null;
-    if (ended) return named(a, "the stream ended in an error event, so its counts are not a reply (head {?}, delta {?})", .{ head, split });
-    if (head == null) return named(a, "the stream carries a message_delta with no message_start to count it against", .{});
-    if (split == null) return named(a, "message_start opened a stream that never reached its message_delta", .{});
-    if (head.? == split.?) return null;
-    return named(a, "message_start's {d} is not message_delta's input plus cache fields {d}", .{ head.?, split.? });
+    if (start_total == null and delta_total == null) return null;
+    if (ended) return named(a, "the stream ended in an error event, so its counts are not a reply (start {?}, delta {?})", .{ start_total, delta_total });
+    if (start_total == null) return named(a, "the stream carries a message_delta with no message_start to count it against", .{});
+    if (delta_total == null) return named(a, "message_start opened a stream that never reached its message_delta", .{});
+    if (start_total.? == delta_total.?) return null;
+    return named(a, "message_start's {d} is not message_delta's input plus cache fields {d}", .{ start_total.?, delta_total.? });
 }
 
 fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case: std.json.Value) !void {
@@ -380,7 +382,7 @@ fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case
                 try why.append(a, try std.fmt.allocPrint(a, "reply {d} body differs at {d}: golden [{s}] zig [{s}]", .{ i, at, gb[at..@min(gb.len, at + 60)], n.body[at..@min(n.body.len, at + 60)] }));
             }
             if (std.mem.eql(u8, group, "anthropic")) {
-                if (try headSplitProblem(a, n.body)) |problem| try why.append(a, problem);
+                if (try promptCountProblem(a, n.body)) |problem| try why.append(a, problem);
             }
             if (!std.mem.eql(u8, go.get("interim").?.string, n.interim)) try why.append(a, try std.fmt.allocPrint(a, "reply {d} interim differs", .{i}));
             var head_ok = true;
