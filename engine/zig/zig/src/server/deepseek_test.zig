@@ -497,3 +497,30 @@ test "long tool history: 120 history calls with garbage arguments, both wires, a
         try checkHistory(&h, a);
     }
 }
+
+test "a streamed reply names its usage in its last chunk on both wires, asked for or not (mini tokenizer)" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    const tok = try serve_mod.tokenizer.Tokenizer.parse(gpa, serve_mod.fixtures.mini_tokenizer);
+    defer tok.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]@FieldType(server_mod.Config, "wire"){ .tensorfold, .spark }) |wire| {
+        errdefer std.debug.print("wire {s}\n", .{@tagName(wire)});
+        var h: Harness = .{ .gpa = gpa, .io = io, .stub = undefined, .ds = undefined, .srv = undefined, .wire = wire };
+        try h.start(tok, tok.tokenId("<｜end▁of▁sentence｜>").?, 2048, .{});
+        defer h.finish();
+        const plain = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}],\"stream\":true,\"max_tokens\":8}";
+        const asked = "{\"messages\":[{\"role\":\"user\",\"content\":\"hi @chat\"}],\"stream\":true,\"max_tokens\":8,\"stream_options\":{\"include_usage\":true}}";
+        for ([_][]const u8{ plain, asked }) |body| {
+            const r = try h.post(a, "/v1/chat/completions", body);
+            try testing.expectEqual(@as(u16, 200), r.status);
+            const evs = try events(a, r.body);
+            const last = evs[evs.len - 2] orelse return error.StreamHasNoLastChunk;
+            const usage = last.get("usage") orelse return error.LastChunkHasNoUsage;
+            try testing.expectEqual(@as(i64, @intCast(h.stub.last_prompt.items.len)), usage.get("prompt_tokens").?.int64().?);
+            try testing.expectEqual(@as(i64, 3), usage.get("prompt_tokens_details").?.get("cached_tokens").?.int64().?);
+        }
+    }
+}

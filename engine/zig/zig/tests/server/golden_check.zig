@@ -199,6 +199,28 @@ const Outcome = struct { group: []const u8, name: []const u8, verdict: Verdict, 
 
 var outcomes: std.ArrayList(Outcome) = .empty;
 
+/// The Anthropic streaming invariant: message_start's whole prompt equals message_delta's input plus cache_read.
+fn headSplitProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
+    var head: ?i64 = null;
+    var split: ?i64 = null;
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        const start = std.mem.startsWith(u8, line, "data: {\"type\": \"message_start\"");
+        if (!start and !std.mem.startsWith(u8, line, "data: {\"type\": \"message_delta\"")) continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, a, line[6..], .{}) catch continue;
+        const node = if (start) (v.object.get("message") orelse continue) else v;
+        const u = node.object.get("usage") orelse continue;
+        const input = u.object.get("input_tokens") orelse continue;
+        const cached = u.object.get("cache_read_input_tokens") orelse continue;
+        if (input != .integer or cached != .integer) continue;
+        if (start) head = input.integer else split = input.integer + cached.integer;
+    }
+    const whole = head orelse return null;
+    const parts = split orelse return null;
+    if (whole == parts) return null;
+    return try std.fmt.allocPrint(a, "message_start input_tokens {d} is not message_delta's input plus cache_read {d}", .{ whole, parts });
+}
+
 fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case: std.json.Value) !void {
     const group = case.object.get("group").?.string;
     const name = case.object.get("name").?.string;
@@ -299,6 +321,9 @@ fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case
                 var at: usize = 0;
                 while (at < gb.len and at < n.body.len and gb[at] == n.body[at]) at += 1;
                 try why.append(a, try std.fmt.allocPrint(a, "reply {d} body differs at {d}: golden [{s}] zig [{s}]", .{ i, at, gb[at..@min(gb.len, at + 60)], n.body[at..@min(n.body.len, at + 60)] }));
+            }
+            if (std.mem.eql(u8, group, "anthropic")) {
+                if (try headSplitProblem(a, n.body)) |problem| try why.append(a, problem);
             }
             if (!std.mem.eql(u8, go.get("interim").?.string, n.interim)) try why.append(a, try std.fmt.allocPrint(a, "reply {d} interim differs", .{i}));
             var head_ok = true;
