@@ -1,4 +1,4 @@
-//! Frozen server goldens for `zig build test-golden`, with the seven differences that are still known.
+//! Frozen server goldens for `zig build test-golden`, with the thirteen differences that are still known.
 const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
@@ -16,6 +16,15 @@ const known_diffs = [_]Known{
     .{ .group = "metrics-open", .name = "metrics" },
     .{ .group = "metrics-open", .name = "v1-metrics" },
     .{ .group = "keys", .name = "metrics-counted" },
+    // The Anthropic stream heads carry the prompt's token count (port of upstream #672 by kky42); the frozen
+    // Python goldens predate it and open with 0, so these six bodies may differ on purpose. The list covers the
+    // wire shape only: headSplitProblem's reasons are gated, so a stream that breaks its own counting fails.
+    .{ .group = "anthropic", .name = "plain-stream" },
+    .{ .group = "anthropic", .name = "thinking-stream" },
+    .{ .group = "anthropic", .name = "tool-use-stream" },
+    .{ .group = "anthropic", .name = "tool-use-think-stream" },
+    .{ .group = "anthropic", .name = "stop-sequence-stream" },
+    .{ .group = "anthropic", .name = "max-tokens" },
 };
 
 fn isKnown(group: []const u8, name: []const u8) bool {
@@ -23,6 +32,18 @@ fn isKnown(group: []const u8, name: []const u8) bool {
         if (std.mem.eql(u8, k.group, group) and std.mem.eql(u8, k.name, name)) return true;
     }
     return false;
+}
+
+/// Why a known difference never covers this outcome: the reply's own counting, which holds whatever a frozen body says.
+const gated_prefix = "INVARIANT: ";
+
+fn isGated(why: []const []const u8) bool {
+    for (why) |w| if (std.mem.startsWith(u8, w, gated_prefix)) return true;
+    return false;
+}
+
+fn isTolerated(r: Outcome) bool {
+    return r.verdict == .differ and isKnown(r.group, r.name) and !isGated(r.why);
 }
 
 const Conn = struct {
@@ -218,7 +239,7 @@ fn headSplitProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
     const whole = head orelse return null;
     const parts = split orelse return null;
     if (whole == parts) return null;
-    return try std.fmt.allocPrint(a, "message_start input_tokens {d} is not message_delta's input plus cache_read {d}", .{ whole, parts });
+    return try std.fmt.allocPrint(a, "{s}message_start input_tokens {d} is not message_delta's input plus cache_read {d}", .{ gated_prefix, whole, parts });
 }
 
 fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case: std.json.Value) !void {
@@ -503,10 +524,11 @@ pub fn main(init: std.process.Init) !void {
         }
         if (g == null) groups.append(gpa, .{ .name = r.group }) catch return error.OutOfMemory;
         g = &groups.items[groups.items.len - 1];
+        const known = isTolerated(r);
         switch (r.verdict) {
             .equal => g.?.equal += 1,
             .differ => {
-                if (isKnown(r.group, r.name)) g.?.known += 1 else {
+                if (known) g.?.known += 1 else {
                     g.?.differ += 1;
                     failed += 1;
                 }
@@ -517,7 +539,6 @@ pub fn main(init: std.process.Init) !void {
             },
         }
         if (r.verdict != .equal) {
-            const known = r.verdict == .differ and isKnown(r.group, r.name);
             std.debug.print("{s} {s}/{s}\n", .{ if (known) "KNOWN-DIFFER" else if (r.verdict == .no_golden) "NO-GOLDEN" else "MISMATCH", r.group, r.name });
             for (r.why, 0..) |w, i| {
                 if (i == 3) break;
