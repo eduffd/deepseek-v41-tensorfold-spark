@@ -220,26 +220,62 @@ const Outcome = struct { group: []const u8, name: []const u8, verdict: Verdict, 
 
 var outcomes: std.ArrayList(Outcome) = .empty;
 
-/// The Anthropic streaming invariant: message_start's whole prompt equals message_delta's input plus cache_read.
+const Usage = struct { total: ?i64 = null, problem: ?[]const u8 = null };
+
+fn named(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const u8 {
+    return std.fmt.allocPrint(a, "{s}" ++ fmt, .{gated_prefix} ++ args) catch "INVARIANT: the usage blob is malformed";
+}
+
+/// One Messages usage blob as a prompt total: input_tokens, cache_read_input_tokens, cache_creation_input_tokens.
+/// A cache field Anthropic omits (nothing was cached) reads as 0; anything not an integer names the field.
+fn usageTotal(a: std.mem.Allocator, usage: std.json.Value, kind: []const u8) Usage {
+    if (usage != .object) return .{ .problem = named(a, "{s}'s usage is not an object", .{kind}) };
+    var total: i64 = 0;
+    for ([_][]const u8{ "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens" }) |field| {
+        const v = usage.object.get(field) orelse continue;
+        if (v == .null) continue;
+        if (v != .integer) return .{ .problem = named(a, "{s}'s {s} is not an integer", .{ kind, field }) };
+        total += v.integer;
+    }
+    return .{ .total = total };
+}
+
+/// The usage of one Messages stream event: message_start keeps it under "message", message_delta at its top.
+fn eventUsage(a: std.mem.Allocator, ev: std.json.Value, kind: []const u8) Usage {
+    const node = if (std.mem.eql(u8, kind, "message_start")) (ev.object.get("message") orelse .null) else ev;
+    const usage = if (node == .object) (node.object.get("usage") orelse .null) else .null;
+    return usageTotal(a, usage, kind);
+}
+
+/// The Anthropic streaming invariant: message_start's whole prompt equals message_delta's input plus its cache
+/// fields. A stream with a head owes the stream its delta, and an error event fails on its own. A reply with
+/// neither half (whole replies, refusals, counts) reports nothing.
 fn headSplitProblem(a: std.mem.Allocator, body: []const u8) !?[]const u8 {
     var head: ?i64 = null;
     var split: ?i64 = null;
+    var ended = false;
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line| {
-        const start = std.mem.startsWith(u8, line, "data: {\"type\": \"message_start\"");
-        if (!start and !std.mem.startsWith(u8, line, "data: {\"type\": \"message_delta\"")) continue;
+        if (!std.mem.startsWith(u8, line, "data: {\"type\": \"")) continue;
         const v = std.json.parseFromSliceLeaky(std.json.Value, a, line[6..], .{}) catch continue;
-        const node = if (start) (v.object.get("message") orelse continue) else v;
-        const u = node.object.get("usage") orelse continue;
-        const input = u.object.get("input_tokens") orelse continue;
-        const cached = u.object.get("cache_read_input_tokens") orelse continue;
-        if (input != .integer or cached != .integer) continue;
-        if (start) head = input.integer else split = input.integer + cached.integer;
+        if (v != .object) continue;
+        const kind = v.object.get("type") orelse continue;
+        if (kind != .string) continue;
+        if (std.mem.eql(u8, kind.string, "error")) {
+            ended = true;
+            continue;
+        }
+        const where = if (std.mem.eql(u8, kind.string, "message_start")) "message_start" else if (std.mem.eql(u8, kind.string, "message_delta")) "message_delta" else continue;
+        const got = eventUsage(a, v, where);
+        if (got.problem) |p| return p;
+        if (std.mem.eql(u8, where, "message_start")) head = got.total else split = got.total;
     }
-    const whole = head orelse return null;
-    const parts = split orelse return null;
-    if (whole == parts) return null;
-    return try std.fmt.allocPrint(a, "{s}message_start input_tokens {d} is not message_delta's input plus cache_read {d}", .{ gated_prefix, whole, parts });
+    if (head == null and split == null) return null;
+    if (ended) return named(a, "the stream ended in an error event, so its counts are not a reply (head {?}, delta {?})", .{ head, split });
+    if (head == null) return named(a, "the stream carries a message_delta with no message_start to count it against", .{});
+    if (split == null) return named(a, "message_start opened a stream that never reached its message_delta", .{});
+    if (head.? == split.?) return null;
+    return named(a, "message_start's {d} is not message_delta's input plus cache fields {d}", .{ head.?, split.? });
 }
 
 fn runCase(a: std.mem.Allocator, io: Io, golden_dir: []const u8, port: u16, case: std.json.Value) !void {
