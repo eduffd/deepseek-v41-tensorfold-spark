@@ -95,13 +95,13 @@ def events_op(world, path, argv):
     The template is validated against the fields `events.Message` answers, and a template naming a field it does not
     answer is exit 64 with no output, which is what the CLI's own check does.
 
-    `--since` / `--until` bound the window the way the daemon bounds it, because the CLI forwards them untouched
-    (docker/cli cli/command/system/events.go): the daemon parses each with strconv.ParseInt of `seconds[.nanoseconds]`
-    (moby api/types/time/timestamp.go, v20.10.24 through v28.5.2, reached from the events route's eventTime), so an
-    epoch is the only form that answers. `180s` and `0s` are parse errors: the daemon answers 400, the CLI prints the
-    parse error, and the read yields no events. Accepting interval forms here is what let a window built from them pass
-    the suite while answering nothing on a node. Each read is recorded in the world, so a test can name the window the
-    scripts emitted."""
+    `--since` / `--until` bound the window the way the *older* daemon bounds it: that daemon parses each with
+    strconv.ParseInt of `seconds[.nanoseconds]` (moby api/types/time/timestamp.go, v20.10.24 through v28.5.2, reached
+    from the events route's eventTime), so an epoch is the only form that answers, and `180s` and `0s` are parse errors
+    printed as the CLI prints them. This is a stricter reader than the production pair: the nodes run Docker 29.6.2,
+    where the CLI parses these flags itself as relative durations and a `180s` window answers events (measured on the
+    head, 2026-10-20). Keeping the shim on the older dialect is the portability check, and epochs are honored by both.
+    Each read is recorded in the world, so a test can name the window the scripts emitted."""
     fmt, fmtflag = argv[0], argv[1] == "1"
     args = argv[2:]
     if fmtflag:

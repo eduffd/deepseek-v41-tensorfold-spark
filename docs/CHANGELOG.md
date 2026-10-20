@@ -22,15 +22,20 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   [OPERATIONS](OPERATIONS.md) ("Watchdog and start at boot") and [ZIG-SERVE](ZIG-SERVE.md) ("Keep it supervised"); the
   wedge's root cause stays open in [KNOWN-ISSUES](KNOWN-ISSUES.md).
 - **The watchdog's die-event witness answered nothing** (this update, from an independent review of the watchdog
-  wave). The fallback's window was emitted as `--since 180s --until 0s`, and docker/cli forwards `--since` and
-  `--until` to the daemon untouched, where they are parsed as epoch seconds (`api/types/time/timestamp.go`): an interval
-  is a parse error, the daemon answers 400, and the scripts sent that failure to `/dev/null`. So the witness meant for a
-  rank with no cooperating launcher (a hand-run `docker run`, an earlyoom SIGKILL) read empty wherever the daemon does
-  the parsing, which is every node, and the suite passed because its `docker events` shim accepted the interval forms.
-  The label on that claim: source-verified, not node-measured. It rests on moby's parser read across five release tags
-  (v20.10 through v28.5.2) and on this repo's shim reproducing the daemon's answer, and the nodes' docker versions are
-  recorded nowhere. The window is epochs now, and the shim parses bounds the way the daemon does, so a window built
-  from intervals is red here and dead on a node, the same fact. A marker from an earlier boot no longer anchors the
+  wave, and measured on the nodes on 2026-10-20). The fallback read events with the template `{{.Time}}
+  {{.Attributes.exitCode}}`, and `Attributes` is not a field of the daemon's `events.Message`: the CLI rejects the
+  template, exits 64 and prints nothing. Measured on both Sparks (Docker 29.6.2, build dfc4efb), and it is why a rank
+  with no cooperating launcher (a hand-run `docker run`, an earlyoom SIGKILL) had no witness: the read answered nothing
+  before it reached the daemon, and the scripts sent that failure to `/dev/null`. The window is epochs now
+  (`--since <epoch> --until <epoch>`), which is measured honored on 29.6.2 and is the form the older daemon parses as
+  seconds (`api/types/time/timestamp.go`, moby read across v20.10 through v28.5.2, source-verified and not
+  node-measured). The interval form `main` emitted (`--since 180s --until 0s`) is not a failure on these nodes, and
+  the claim that it was is refuted by measurement: 29.6.2 parses `--since`/`--until` client-side as relative durations,
+  so a window of `180s` to `0s` was honored. Measured on Spark1 with a die event made by the leg itself, `--since 1s`
+  excluded it at 3 s old, `--since 60s` and `--since 180s` included it, all rc 0. The epoch form is kept for that
+  reason, portability and not a repair: the older daemon parses only seconds, and epochs work on both dialects. This
+  repo's `docker events` shim implements the daemon dialect (epoch seconds, an interval answered as
+  `strconv.ParseInt: parsing "180s": invalid syntax`), which is a stricter reader than the nodes run. A marker from an earlier boot no longer anchors the
   window (it is a file, and it outlives the boot that wrote it). Two rows a stop owes are now printed: a removal the
   worker's daemon refuses alerts with the container named, and a worker config naming no `STATE_DIR` says so instead of
   reading rank 1 as a plain absence. The fixture's shared `world.json` reads take its lock, which is the mechanism

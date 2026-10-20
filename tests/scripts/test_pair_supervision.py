@@ -447,12 +447,12 @@ class TestDieEventWitness(ShellCase):
         self.assertIn("serving on :8199", self.run_to_ready(self.rig),
                       f"the first tick launches the heal: {lines}")
 
-    def test_the_die_event_window_is_emitted_in_the_form_the_daemon_parses(self) -> None:
-        """The window's shape is part of the witness: docker/cli forwards --since and --until to the daemon untouched,
-        and the daemon parses each with strconv.ParseInt of seconds, so `180s` and `0s` are parse errors, the query
-        answers nothing, and a rank with no cooperating launcher reads as having no witness at all. The shim answers
-        the window the way the daemon does, so a window built from intervals is red here and dead on a node, not two
-        different facts."""
+    def test_the_die_event_window_is_emitted_in_the_form_both_docker_dialects_parse(self) -> None:
+        """The window's form is part of the witness, and the two dialects disagree about intervals. The pair's nodes run
+        Docker 29.6.2, where the CLI parses --since and --until itself as relative durations (measured on the head on
+        2026-10-20), and the older daemon parses each with strconv.ParseInt of seconds, where `180s` is a parse error
+        and the query answers nothing. Epochs are honored by both, so the scripts print epochs. The shim models the
+        older dialect, so its interval refusal is the portability check and not a claim about the nodes."""
         r0, r1 = self.rig.zig_names()
         self.rig.container(r0)
         self.rig.absent(r1)
@@ -476,9 +476,9 @@ class TestDieEventWitness(ShellCase):
             f"docker events --filter event=die --filter container={r1} "
             f"--format '{{{{.Time}}}} {{{{.Actor.Attributes.exitCode}}}}' --since 180s --until 0s")
         self.assertEqual(interval.stdout, "",
-                         f"an interval window yields no events, the way the daemon's 400 does: {interval.stdout}")
+                         f"an interval window yields no events, the older daemon's 400 answer: {interval.stdout}")
         self.assertEqual(interval.returncode, 1,
-                         f"and the CLI prints the daemon's parse error: {interval.stderr}")
+                         f"and the shim answers with that daemon's parse error: {interval.stderr}")
         self.assertIn("strconv.ParseInt", interval.stderr, f"{interval.stderr}")
 
 
