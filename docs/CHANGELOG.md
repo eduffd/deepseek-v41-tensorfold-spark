@@ -5,6 +5,20 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
 
 ## Bugs fixed
 
+- **Rank 0's Zig engine exits 70 on a wedged round** (this update, fork
+  [issue #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1)). The engine's own stall watch reads
+  `TF_DSV41_STALL_S` (default 300 s) and `TF_DSV41_STALL_EXIT_S` (`GLM53_TF_` wins, default 0; both Zig profiles now
+  set 300), starts before the lane host's engine thread, and polls a round clock the engine thread publishes without
+  the host mutex, so it does not depend on `/health`. A round in flight past the exit knob prints one report and one
+  exit line to stderr, then exits 70, so the watchdog restarts both ranks; a normal drain ends its round first and
+  never fires. The report names the round, the phase and both elapsed times, plus the host's running and waiting
+  counts and plan sizes; it has no thread stacks, which Zig std cannot dump, so `gdb -p` remains the stack tool.
+  `/health`'s stall labels are unchanged, and the replay gates (`serve_cli`, `sess4`, `mdraft`, `slots`) pass the
+  watch off. Rank 1's own watch ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)), peer-wait
+  deadlines ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and the stale mailbox
+  ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) remain open. The 300 s is above every
+  measured round, but a cold whole-prompt prefill is armed from admission and p100 is unmeasured, so a legitimate
+  prefill over 300 s restarts the pair.
 - **A Zig pair that dies or wedges now restarts itself** (this update, the head-side watchdog on the Zig profile).
   `scripts/run-zig.sh` records `<code> <epoch> <boot_id>` in `$STATE_DIR/exit-r<rank>` on every invocation, so a
   `docker run --rm` rank's fail-fast exit 70 is a witnessed death and heals on the watchdog's first tick, at most once
