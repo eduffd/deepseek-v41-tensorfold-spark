@@ -16,8 +16,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
 CONFIG=${CONFIG:-config/prod.env}
-# serve.sh carries the config, the state dir, the readiness gate and the recipe's boot decision. Sourcing applies its
-# `set -e` to this shell, and boot-start must run past a failed start to log what serving answers, so it comes off.
+# Sourcing serve.sh applies its `set -e` to this shell, and boot-start must run past a failed start to log what
+# serving answers, so it comes off.
 SERVE_LIB=1
 # shellcheck disable=SC1090
 source scripts/serve.sh
