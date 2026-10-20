@@ -98,7 +98,7 @@ Host memory and stalls (G12; defaults in brackets):
   flight and the current round has run that long, so the watchdog restarts both ranks. The watch owns its round clock
   and reads it without the lane host's mutex, so it does not depend on `/health`; the vendor Python family's
   `stall.py` `Watch` also prints every thread's stack, which Zig std cannot, so the report names the phase and both
-  elapsed times and `gdb -p` remains the stack tool. `/health` keeps its own semantics: its `stalled[]` list reads
+  elapsed times and `gdb -p` remains the stack tool. `/health` keeps its own semantics. Its `stalled[]` list reads
   `TF_DSV41_STALL_S` (default 0), and its stall labels read `TF_DSV41_STALL_ROUND_S` (120) and
   `TF_DSV41_STALL_SLOW_S` (180). `GLM53_TF_STALL_S` and `GLM53_TF_STALL_EXIT_S` win over the `TF_DSV41_` spellings, and
   the replay gates pass the watch off. The fail-fast exit 70 (`TF_DSV41_FAILFAST`) is separate, and the watchdog heals
