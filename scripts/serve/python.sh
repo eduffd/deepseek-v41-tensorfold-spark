@@ -67,7 +67,7 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
     else out=$(wssh docker inspect -f "'{{.State.ExitCode}} {{.State.FinishedAt}}'" "$NAME-r1" 2>/dev/null) && rc=0 || rc=$?; fi
     [[ $rc == 0 ]] || { echo ""; return 0; }
     read -r code fin <<< "$out"
-    fin_epoch=$(date -d "$fin" +%s 2>/dev/null || echo 0)
+    fin_epoch=$(epoch_of "$fin")
     if (( fin_epoch >= $(boot_start_epoch) )); then echo "$code $fin_epoch $(boot_id)"; else echo "$code $fin_epoch "; fi
 }
 

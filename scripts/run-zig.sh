@@ -1,8 +1,18 @@
 #!/usr/bin/env bash
 # Run one local rank. Invoke separately on each node with the same serving env.
+#
+#   scripts/run-zig.sh 0|1                  the rank in this terminal; its streams go to this terminal
+#   scripts/run-zig.sh 0|1 --detached       self-supervise in the background, into $STATE_DIR/run-zig-r<rank>.log,
+#                                           recording its pid in $STATE_DIR/supervisor-r<rank>.pid (serve.sh stop ends it)
+#   scripts/run-zig.sh 0|1 --dry-run        print the docker run arguments, launch nothing
+#   scripts/run-zig.sh 0|1 --check-aot      check this env's Triton variants against $ASSETS_DIR/aot (docs/ZIG-SERVE.md)
+#
+# Every invocation ends by writing "$STATE_DIR/exit-r<rank>" as "<code> <epoch> <boot_id>": the containers run with
+# --rm, so that record is the watchdog's exit witness (scripts/serve/zig.sh pair_exit reads it).
+# One stack per pair: this refuses while its own rank's container exists.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot]}
+rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot|--detached]}
 [[ "$rank" == 0 || "$rank" == 1 ]] || { echo 'rank must be 0 or 1' >&2; exit 2; }
 config=${CONFIG:-config/prod-zig.env}
 [[ -f "$config" ]] || { echo "missing $config; copy config/prod-zig.env.example first" >&2; exit 2; }
@@ -79,4 +89,59 @@ if [[ "$table" == /cache/* && ! -e "$CACHE_DIR/${table#/cache/}" ]]; then
     echo "copied config/pfdense-table.json to $CACHE_DIR/${table#/cache/} (TF_DSV41_PF_DENSE_TABLE=$table)" >&2
 fi
 mkdir -p "$PREPARED_DIR" "$STATE_DIR/sessions"
-exec "${args[@]}"
+name="tensorfold-zig-r$rank"
+if docker inspect "$name" >/dev/null 2>&1; then
+    echo "rank $rank: container $name exists: this pair runs one stack. Stop it first (.claude/skills/verify/bin/down.sh from the Mac, scripts/serve.sh stop on the head), then run-zig.sh $rank." >&2
+    exit 1
+fi
+boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
+
+run_rank() { # the container, then its exit witness. The temp + mv -f keeps a reader from ever seeing a half-written
+    # record, which is the only thing standing between a crash and a tick that reads no witness at all.
+    local code tmp
+    "${args[@]}" && code=0 || code=$?
+    tmp="$STATE_DIR/.exit-r$rank.$$.tmp"
+    printf '%s %s %s\n' "$code" "$(date +%s)" "$boot_id" > "$tmp"
+    mv -f "$tmp" "$STATE_DIR/exit-r$rank"
+    return "$code"
+}
+
+rank_log="$STATE_DIR/run-zig-r$rank.log"
+
+cap_rank_log() { # keep the newest 8 launch sections: the log a heal reads tails of must not grow without bound. In
+    # place, because this loop's own stdout is that file.
+    local n="" start tmp
+    n=$(grep -c '^=== run-zig rank ' "$rank_log" 2>/dev/null || true); [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    (( n > 8 )) || return 0
+    start=$(grep -n '^=== run-zig rank ' "$rank_log" | tail -n 8 | cut -d: -f1 | head -1)
+    [[ -n "$start" ]] || return 0
+    tmp="$STATE_DIR/.run-zig-r$rank.$$.tmp"
+    tail -n "+$start" "$rank_log" > "$tmp" && cat "$tmp" > "$rank_log"
+    rm -f "$tmp"
+}
+
+if [[ "${DSV41_ZIG_DETACHED:-0}" == 1 ]]; then         # the supervised loop: already detached, log open, rank's own node
+    echo $$ > "$STATE_DIR/supervisor-r$rank.pid"       # the pid a human stop ends the loop by (scripts/serve/zig.sh)
+    code=0
+    while :; do
+        cap_rank_log
+        echo "=== run-zig rank $rank $(date -u +%Y-%m-%dT%H:%M:%S) ==="
+        run_rank && code=0 || code=$?
+        echo "rank $rank: the container exited $code"
+        # A clean exit and a fail-fast 70 are the pair ending (a drained stop, or a death on either rank ending both),
+        # and the pair's watchdog relaunches a pair. This loop relaunches only a rank that died alone.
+        [[ "$code" == 0 || "$code" == 70 ]] && break
+        sleep 5
+    done
+    exit "$code"
+fi
+
+if [[ "${2:-}" == --detached ]]; then
+    setsid nohup env DSV41_ZIG_DETACHED=1 bash "${BASH_SOURCE[0]}" "$rank" --detached \
+        >> "$rank_log" 2>&1 < /dev/null &
+    exit 0
+fi
+
+code=0
+run_rank && code=0 || code=$?
+exit "$code"
