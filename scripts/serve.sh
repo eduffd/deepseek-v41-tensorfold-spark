@@ -191,7 +191,8 @@ preflight() { # read-only checks of both nodes; non-zero on a problem. $1 = stat
     if [[ "${1:-}" == static ]]; then return $bad; fi    # static: what can be checked while something else serves
     listening "$PORT" && { log "preflight: something listens on :$PORT already (the other stack?)"; bad=1; }
     listening "$MASTER_PORT" && { log "preflight: the rendezvous port $MASTER_PORT is in use"; bad=1; }
-    docker run --rm -v "$CACHE_VOL:/cache" --entrypoint sh "$IMAGE" -c 'test -e /cache/roce-failed' 2>/dev/null \
+    # shellcheck disable=SC2046
+    docker run --rm $(cache_mount head) --entrypoint sh "$IMAGE" -c 'test -e /cache/roce-failed' 2>/dev/null \
         && log "preflight: warning: /cache/roce-failed exists (both ranks start on NCCL; delete it to retry RoCE)"
     if gpu_busy; then log "preflight: a CUDA process is running on a node: stop it first"; bad=1; fi
     return $bad
@@ -274,7 +275,8 @@ cmd_start() {
         2) log "canary failed: stopping both ranks (logs in $STATE_DIR)"; mkdir -p "$STATE_DIR"
            docker logs --tail 200 "$NAME-r0" > "$STATE_DIR/canary-fail-r0.log" 2>&1 || true
            wssh docker logs --tail 200 "$NAME-r1" > "$STATE_DIR/canary-fail-r1.log" 2>&1 || true
-           pair_stop 0; exit 1 ;;
+           pair_stop 0; mark_stopped; exit 1 ;;   # the human owns this pair now: the stop marker keeps the watchdog
+                                                   # from relaunching a pair the canary refused
         3) log "short of request slots twice: leaving it up for 'logs'; stop / restart after dropping caches"; exit 3 ;;
         *) log "start failed; 'logs' to inspect, 'stop' removes the containers"; exit 1 ;;
     esac
@@ -417,7 +419,13 @@ classify() { # one merge site, reading watch_tick's locals: sets bad (the verdic
         [[ "$cls" == definitive ]] && bad="$bad (fail-fast exit 70)"
         return 0
     fi
-    if [[ "$r1" == unreachable ]]; then cls=standdown; stand="worker unreachable over ssh (not counted)"; return 0; fi
+    if [[ "$r1" == unreachable ]]; then
+        # A worker that does not answer is not the pair being unhealthy, so it is not counted. It is said loudly:
+        # from here rank 1 is unwatched, and half a pair serving answers /health 200 all by itself.
+        cls=standdown; stand="worker unreachable over ssh (not counted)"
+        alert "worker unreachable over ssh: rank 1 unwatched, so a rank-1-only wedge heals from nothing"
+        return 0
+    fi
     if [[ "$r1" != true ]]; then
         bad="rank 1 $r1"; cls=$(witness_class "$c1" "$t1" "$b1")
         [[ "$cls" == definitive ]] && bad="$bad (fail-fast exit 70)"
@@ -469,10 +477,12 @@ watch_tick() {
     fi
     echo "$now" > "$heal_f"; echo 0 > "$fails_f"; echo $((heals + 1)) > "$heals_f"
     alert "unhealthy ($bad); restarting both ranks"
-    # The verdict travels with the heal, which writes it into its evidence folder before it stops the pair.
-    setsid env DSV41_TF_LOCKED=1 DSV41_TF_HEAL=1 DSV41_TF_GRACE="$WATCH_HEAL_GRACE" CANARY=off \
+    # The verdict travels with the heal, which writes it into its evidence folder before it stops the pair. The
+    # restart takes the lock itself, non-blocking: a human start that began after this tick's check owns the pair,
+    # and a heal that queued behind it would stop the pair the human is mid-start on.
+    setsid env DSV41_TF_HEAL=1 DSV41_TF_GRACE="$WATCH_HEAL_GRACE" CANARY=off \
         DSV41_TF_CLASS="$cls" DSV41_TF_NOTE="$bad" DSV41_TF_W0="$e0" DSV41_TF_W1="$e1" \
-        flock "$STATE_DIR/lock" "$0" restart >>"$STATE_DIR/heal.log" 2>&1 < /dev/null &
+        "$0" restart >>"$STATE_DIR/heal.log" 2>&1 < /dev/null &
     return 1
 }
 
@@ -487,8 +497,17 @@ cmd_build() { # the image here from docker/Dockerfile (vendor/TensorFold + patch
     if [[ "${PREBUILD:-1}" != 0 ]]; then cmd_prebuild; else log "PREBUILD=0: the first start compiles the extensions"; fi
 }
 
+cache_mount() { # $1 = head|worker: the -v that fills a node's cache where that node's launcher mounts it. The
+    # Python recipe names a docker volume, the same on both nodes; the Zig recipe mounts a per-node directory
+    # ($CACHE_DIR), named in that node's own config, so its worker's path is read from the worker.
+    if [[ "$RECIPE" == zig ]]; then
+        if [[ "$1" == worker ]]; then echo "-v '$(worker_config_key CACHE_DIR)':/cache"; else echo "-v $CACHE_DIR:/cache"; fi
+    else echo "-v $CACHE_VOL:/cache"; fi
+}
+
 cmd_prebuild() { # both nodes: the CUDA extensions into CACHE_VOL with nothing else in memory (a build beside the
     # weights once took the worker to 1.26 GiB MemAvailable). The script goes in on stdin, so nothing is copied.
+    [[ "$RECIPE" == zig ]] && { log "prebuild: the Zig recipe builds no CUDA extensions; check its Triton variants with scripts/run-zig.sh <rank> --check-aot (docs/ZIG-SERVE.md)"; exit 2; }
     if [[ "$(running 0)" == true || "$(running 1)" == true ]]; then log "the server is running: scripts/serve.sh stop first"; exit 1; fi
     if gpu_busy; then log "a CUDA process is running on a node; stop it first"; exit 1; fi
     local env_args="-e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton"
@@ -516,15 +535,17 @@ cmd_prebuild() { # both nodes: the CUDA extensions into CACHE_VOL with nothing e
 cache_files() { # the cache volume's data files on both nodes: the pfdense tuning table (TF_DSV41_PF_DENSE_TABLE) and,
     # for TF_DSV41_IMAGES=native, the image routing bias the EXL3 packs dropped (TF_DSV41_BIAS_VL; 66 KB fetched by
     # range requests from deepseek-ai/DeepSeek-V4.1-Flash, so both nodes need network access once)
-    local tbl="${TF_DSV41_PF_DENSE_TABLE:-}" bvl="${TF_DSV41_BIAS_VL:-}" put
+    local tbl="${TF_DSV41_PF_DENSE_TABLE:-}" bvl="${TF_DSV41_BIAS_VL:-}" put wput
     if [[ -n "$tbl" && "$tbl" == /cache/* && -f config/pfdense-table.json ]]; then
-        put="docker run --rm -i -v $CACHE_VOL:/cache --entrypoint sh $IMAGE -c 'mkdir -p \$(dirname $tbl) && cat > $tbl'"
-        bash -c "$put" < config/pfdense-table.json && wssh "$put" < config/pfdense-table.json \
+        put="docker run --rm -i $(cache_mount head) --entrypoint sh $IMAGE -c 'mkdir -p \$(dirname $tbl) && cat > $tbl'"
+        wput="docker run --rm -i $(cache_mount worker) --entrypoint sh $IMAGE -c 'mkdir -p \$(dirname $tbl) && cat > $tbl'"
+        bash -c "$put" < config/pfdense-table.json && wssh "$wput" < config/pfdense-table.json \
             && log "cache: config/pfdense-table.json -> $tbl on both nodes" || { log "cache: copying the pfdense table failed"; exit 1; }
     fi
     if [[ "${TF_DSV41_IMAGES:-}" == native && -n "$bvl" && "$bvl" == /cache/* ]]; then
-        local fetch="docker run --rm -v $CACHE_VOL:/cache -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
-        bash -c "$fetch" && wssh "$fetch" && log "cache: $bvl/bias_vl.safetensors on both nodes" \
+        local fetch="docker run --rm -i $(cache_mount head) -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
+        local wfetch="docker run --rm -i $(cache_mount worker) -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
+        bash -c "$fetch" && wssh "$wfetch" && log "cache: $bvl/bias_vl.safetensors on both nodes" \
             || { log "cache: fetching the image routing bias failed (TF_DSV41_IMAGES=native needs it)"; exit 1; }
     fi
 }
@@ -560,7 +581,7 @@ start) cmd_start ;;
 # The heal's restart drains with WATCH_HEAL_GRACE (0 for a human restart, which has never had a drain step) and writes
 # its evidence before the force stop, when the wedged pair's own words are last readable.
 restart) take_lock; [[ "${DSV41_TF_HEAL:-0}" == 1 ]] && capture_evidence; pair_stop "${DSV41_TF_GRACE:-0}"; log "stopped"; cmd_start ;;
-stop) pair_stop 0; mark_stopped; log "stopped (stop marker: $STATE_DIR/stopped)" ;;
+stop) take_lock; pair_stop 0; mark_stopped; log "stopped (stop marker: $STATE_DIR/stopped)" ;;
 heal) cmd_heal ;;
 status)
     docker ps -a --filter "name=^$NAME-r" --format '{{.Names}} {{.Status}}'
@@ -573,6 +594,7 @@ preflight) preflight "${2:-}" && log "preflight ok${2:+ ($2)}" ;;
 watch)
     if [[ "${2:-}" == --once ]]; then watch_tick; exit $?; fi
     while :; do watch_tick || true; sleep "${WATCH_INTERVAL:-60}"; done ;;
-args) IMAGE_ID="${IMAGE_ID:-$IMAGE}" pair_args "${2:-0}"; echo ;;
+args) if [[ "$RECIPE" == zig ]]; then scripts/run-zig.sh "${2:-0}" --dry-run   # the Zig launcher prints its own arguments
+      else IMAGE_ID="${IMAGE_ID:-$IMAGE}" pair_args "${2:-0}"; echo; fi ;;
 *) sed -n '2,18p' "$0"; exit 2 ;;
 esac
