@@ -8,9 +8,12 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
 - **A Zig pair that dies or wedges now restarts itself** (this update, the head-side watchdog on the Zig profile).
   `scripts/run-zig.sh` records `<code> <epoch> <boot_id>` in `$STATE_DIR/exit-r<rank>` on every invocation, so a
   `docker run --rm` rank's fail-fast exit 70 is a witnessed death and heals on the watchdog's first tick, at most once
-  every `WATCH_FF_MIN_HEAL` (120 s). Recovery is arithmetic: at most `WATCH_INTERVAL` (60 s) to notice, the heal's
-  `WATCH_HEAL_GRACE` (20 s) drain, the measured 122 s warm relaunch, so about 3.5 minutes. Only the 122 s is a
-  measurement; the drill that times the sum on the nodes is open.
+  every `WATCH_FF_MIN_HEAL` (120 s). Recovery is arithmetic, and for the wedge it is a floor: at most `WATCH_INTERVAL`
+  (60 s) to notice, the heal's `WATCH_HEAL_GRACE` (20 s) drain, the measured 122 s warm relaunch, so about 3.5 minutes.
+  Only the 122 s is a measurement, and it was measured on a pair drained by `bin/up.sh`, not on a wedge heal. The
+  heal's own path is not in the sum: the worker's drain poll runs up to 50 s when a wedged rank 1 lingers
+  (`scripts/serve/zig.sh`'s `(grace + 30) / 5` loop), and the force stop, the evidence capture and the preflight follow
+  it. The drill that times the sum on the nodes is open.
   The 2026-10-19 wedge is the before. No actor watched it, and it ran ~80 minutes to a human stop and start. A heal
   captures the wedged pair into `$STATE_DIR/heal-<utc>/` before the force stop destroys its
   containers, `WATCH_MAX_HEALS` (5) stops the healing of a pair that keeps coming back wedged, `scripts/serve.sh heal`
@@ -18,17 +21,30 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   state a wedged rank 1 leaves rank 0 reporting. Units, knobs and stand-downs are in
   [OPERATIONS](OPERATIONS.md) ("Watchdog and start at boot") and [ZIG-SERVE](ZIG-SERVE.md) ("Keep it supervised"); the
   wedge's root cause stays open in [KNOWN-ISSUES](KNOWN-ISSUES.md).
-- **The watchdog's die-event witness answered nothing on a real node** (this update, from an independent review of the
-  watchdog wave). The fallback's window was emitted as `--since 180s --until 0s`, and docker/cli forwards `--since` and
+- **The watchdog's die-event witness answered nothing** (this update, from an independent review of the watchdog
+  wave). The fallback's window was emitted as `--since 180s --until 0s`, and docker/cli forwards `--since` and
   `--until` to the daemon untouched, where they are parsed as epoch seconds (`api/types/time/timestamp.go`): an interval
   is a parse error, the daemon answers 400, and the scripts sent that failure to `/dev/null`. So the witness meant for a
-  rank with no cooperating launcher (a hand-run `docker run`, an earlyoom SIGKILL) read empty on every node, and the
-  suite passed because its `docker events` shim accepted the interval forms. The window is epochs now, and the shim
-  parses bounds the way the daemon does, so a window built from intervals is red here and dead on a node, the same
-  fact. A marker from an earlier boot no longer anchors the window (it is a file, and it outlives the boot that wrote
-  it). Two rows a stop owes are now printed: a removal the worker's daemon refuses alerts with the container named, and
-  a worker config naming no `STATE_DIR` says so instead of reading rank 1 as a plain absence. The fixture's shared
-  `world.json` reads take its lock, which is the root of the canary test's 1-in-5 red.
+  rank with no cooperating launcher (a hand-run `docker run`, an earlyoom SIGKILL) read empty wherever the daemon does
+  the parsing, which is every node, and the suite passed because its `docker events` shim accepted the interval forms.
+  The label on that claim: source-verified, not node-measured. It rests on moby's parser read across five release tags
+  (v20.10 through v28.5.2) and on this repo's shim reproducing the daemon's answer, and the nodes' docker versions are
+  recorded nowhere. The window is epochs now, and the shim parses bounds the way the daemon does, so a window built
+  from intervals is red here and dead on a node, the same fact. A marker from an earlier boot no longer anchors the
+  window (it is a file, and it outlives the boot that wrote it). Two rows a stop owes are now printed: a removal the
+  worker's daemon refuses alerts with the container named, and a worker config naming no `STATE_DIR` says so instead of
+  reading rank 1 as a plain absence. The fixture's shared `world.json` reads take its lock, which is the mechanism
+  behind the canary test's 1-in-5 red.
+  A second review pass, on a third model family, found the pair's own stop standing inside that window. The daemon's
+  lower bound is inclusive, and a force stop killed the ranks inside the same whole second as the marker it writes, so
+  the window witnessed the stop's own SIGKILLs and the tick relaunched a pair the operator had just stopped. The fix
+  is at the marker, not at the readers that lean on it: `mark_stopped` stamps one second after the force kill, which
+  puts the stop's own kills outside the window, and the tick's comparison against the marker is inclusive at the
+  marker's own second, because that is the second a rank dying a beat behind its peer leaves its witness in. The
+  stop's alert also requires the container to be seen after a failed removal: `docker rm -f` answers a non-zero code
+  for a name the daemon cannot find, and rank 1 leaves on its own when its peer's stop ends its launcher, so a routine
+  stop says nothing. `mount_words` quotes per argument, where one `%q` over the joined pair made a cache path with a
+  space one unparseable argument for docker.
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
   occurrence of an image, so an agent history that resends the same screenshot released it early; the next request
   with that image raised `KeyError` inside rank 0's prefill forward, rank 1 waited in the exchange, and both ranks
