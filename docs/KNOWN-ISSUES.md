@@ -13,7 +13,10 @@
   pair, start it again, ready in 122 s, about 80 minutes after the pair went dead. The self-heal watchdog
   ([OPERATIONS](OPERATIONS.md) "Watchdog and start at boot") bounds the outage instead. An engine-labelled 503 is a
   definitive verdict, so the pair heals on the tick that sees it, at most once every `WATCH_FF_MIN_HEAL` (120 s), and
-  with the measured 122 s warm relaunch, serving returns in roughly 2-3 minutes. `WATCH_MAX_HEALS` (5) stops the
+  serving returns in about 3.5 minutes of arithmetic: at most `WATCH_INTERVAL` (60 s) to notice, the heal's
+  `WATCH_HEAL_GRACE` (20 s) drain, and the measured 122 s warm relaunch. The 122 s is measured on the pair; the notice
+  and drain terms are the config's own numbers, and no end-to-end outage drill has timed the sum on the nodes yet.
+  `WATCH_MAX_HEALS` (5) stops the
   healing of a pair that keeps coming back wedged, and each heal writes its evidence to `$STATE_DIR/heal-<utc>/` before
   the force stop destroys the pair. The idle probe (`WATCH_PROBE`) covers the shape rank 0 cannot report, a wedged
   rank 1 beside an idle rank 0. The wedge itself is unfixed. Upstream
