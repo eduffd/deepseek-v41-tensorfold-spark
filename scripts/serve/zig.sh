@@ -64,10 +64,12 @@ pair_required_keys() { # the keys this recipe's config must set (serve.sh has ch
     [[ "$NAME" == tensorfold-zig ]] || { echo "[dsv41-tf] $CONFIG: NAME=$NAME, scripts/run-zig.sh launches tensorfold-zig-r0 and tensorfold-zig-r1: set NAME=tensorfold-zig" >&2; exit 2; }
 }
 
-exit_lookback_since() { # the die-event window's start, printed as an epoch. docker/cli forwards --since and --until
-    # to the daemon untouched, and the daemon parses them with strconv.ParseInt of seconds (moby
-    # api/types/time/timestamp.go, v20.10 through v28.5.2): an interval like 180s is a parse error, the query answers
-    # nothing, and a rank with no cooperating launcher reads as having no witness at all. The window opens at the pair's
+exit_lookback_since() { # the die-event window's start, printed as an epoch, the one form both docker dialects answer.
+    # The pair's nodes run Docker 29.6.2, where the CLI parses --since and --until itself as relative durations
+    # (measured on the head 2026-10-20: --since 180s --until 0s answered a 3-second-old die event, --since 1s did not).
+    # The older daemon parses them as seconds with strconv.ParseInt (moby api/types/time/timestamp.go, v20.10 through
+    # v28.5.2, source-verified), where an interval is a parse error and the query answers nothing. Epochs are honored
+    # in both, so the window is printed as epochs and stays portable across the two. The window opens at the pair's
     # last human stop *on this boot*, because an event from before that stop is a death that stop already answered, not
     # this one. The marker's own boot id is the check: a stop from before the reboot says nothing about this boot's
     # pair, and anchoring on it would stretch the window across the reboot and read a pre-reboot death as this boot.

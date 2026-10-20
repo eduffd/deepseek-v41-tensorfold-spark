@@ -164,8 +164,11 @@ counter, marker, log or heal folder is shared between them.
   the two nodes reboot independently, and rank 1's death belongs to its node's boot, never the head's. The adapter
   compares each rank's record with the boot of the node it ran on and answers the tick in the head's terms. When no
   record exists, which covers a hand-run `docker run` and an earlyoom SIGKILL, the `die` event is the witness, read
-  over a window given in epoch seconds: `--since`/`--until` go to the daemon untouched, and the daemon parses them as
-  seconds (`180s` is a parse error, and the read answers nothing). The window reaches `WATCH_EXIT_LOOKBACK_S` (180 s)
+  with the template the CLI validates (`{{.Time}} {{.Actor.Attributes.exitCode}}`; a top-level `.Attributes` is not a
+  field of `events.Message`, and the CLI exits 64 printing nothing, measured on both Sparks) and over a window given in
+  epoch seconds, the form both dialects answer: the nodes' Docker 29.6.2 parses `--since`/`--until` client-side as
+  relative durations, measured 2026-10-20, and the older daemon parses them as epoch seconds only (moby
+  `api/types/time/timestamp.go`, source-verified). The window reaches `WATCH_EXIT_LOOKBACK_S` (180 s)
   back, or from the last stop marker forward when that marker is from this boot, so a death that stop answered is not
   read as this one, and a stop from before the reboot anchors nothing. The stop's own kills are outside that window
   because of how the marker is stamped, not how the window is cut: the daemon's lower bound is inclusive, so
