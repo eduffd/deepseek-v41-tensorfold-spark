@@ -168,11 +168,15 @@ counter, marker, log or heal folder is shared between them.
   over a window given in epoch seconds: `--since`/`--until` go to the daemon untouched, and the daemon parses them as
   seconds (`180s` is a parse error, and the read answers nothing). The window reaches `WATCH_EXIT_LOOKBACK_S` (180 s)
   back, or from the last stop marker forward when that marker is from this boot, so a death that stop answered is not
-  read as this one, and a stop from before the reboot anchors nothing. A witness from an earlier boot is an earlier
-  boot's death, never this one's.
+  read as this one, and a stop from before the reboot anchors nothing. The stop's own kills are outside that window
+  because of how the marker is stamped, not how the window is cut: the daemon's lower bound is inclusive, so
+  `mark_stopped` writes the marker one second *after* the force kill, and epochs are whole seconds. A rank that dies a
+  beat behind its peer lands in the marker's own second and is inside the window, where the tick answers it as the
+  stop's. A witness from an earlier boot is an earlier boot's death, never this one's.
 - The tick stands down while the start lock is held (a start, a heal's restart, a stop), while rank 0 is loading
   (`WATCH_GRACE`), after a deliberate
-  `scripts/serve.sh stop` in the same boot (the stop marker), when both ranks are absent with no witness and no marker
+  `scripts/serve.sh stop` in the same boot (the stop marker, and the marker's own second counts, which is the second a
+  rank dying a beat behind its peer leaves its witness in), when both ranks are absent with no witness and no marker
   (the pair never started on this node), and while `WATCH_LEASE` is fresh (`WATCH_LEASE_MIN` 20 min, re-touchable). The
   marker owns the human teardown, and only that. A worker that does not answer ssh is not counted either, and it is
   alerted by name: from the head, rank 1 is unwatched, and half a pair answers `/health` 200 by itself. A worker that
@@ -181,7 +185,10 @@ counter, marker, log or heal folder is shared between them.
 - A start the canary refused is a pair stopped on purpose: the canary-failed start writes the stop marker, so the
   watchdog leaves the pair the canary rejected for the human to read (`$STATE_DIR/canary-fail-r0.log`,
   `canary-fail-r1.log`). A `stop` and a heal both take the start lock, non-blocking: neither queues behind a start it
-  would race, and each says so in its log.
+  would race, and each says so in its log. A `stop` alerts only on a removal the worker's daemon refused on a
+  container that is *still there* after the failed removal, which it checks by inspecting it: a rank 1 whose peer
+  stopped leaves on its own (its launcher's fate plus `--rm`), and `docker rm -f` answers non-zero for a name the
+  daemon cannot find, so an alert keyed on the return code alone fires on every routine stop and stops being read.
 - A heal counts. `WATCH_MAX_HEALS` (5) consecutive heals with no clean tick between them alert and stop healing
   (`0` turns the cap off); a clean tick resets the count in `$STATE_DIR/heals`. A pair that keeps coming back wedged
   needs a human look, not a sixth restart.

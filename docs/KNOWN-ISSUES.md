@@ -15,7 +15,10 @@
   definitive verdict, so the pair heals on the tick that sees it, at most once every `WATCH_FF_MIN_HEAL` (120 s), and
   serving returns in about 3.5 minutes of arithmetic: at most `WATCH_INTERVAL` (60 s) to notice, the heal's
   `WATCH_HEAL_GRACE` drain (20 s as both shipped Zig profiles set it; the scripts default is 15), and the measured
-  122 s warm relaunch. The 122 s is measured on the pair; the notice and drain terms are the config's own numbers, and
+  122 s warm relaunch. That sum is a floor for the wedge family, not its expected time: the 122 s was measured on a
+  pair drained by `bin/up.sh` and not on a wedge heal, and the heal's own path is outside the sum (the worker's drain
+  poll runs up to 50 s when a wedged rank 1 lingers, then the force stop, the evidence capture and the preflight).
+  The 122 s is measured on the pair; the notice and drain terms are the config's own numbers, and
   no end-to-end outage drill has timed the sum on the nodes yet.
   `WATCH_MAX_HEALS` (5) stops the
   healing of a pair that keeps coming back wedged, and each heal writes its evidence to `$STATE_DIR/heal-<utc>/` before
@@ -56,3 +59,12 @@
   `TF_DSV41_DRAFT_VOCAB=<file>` and `tests/test_dsv41_draft_head.py::test_shipped_ranking` fails. A ranking of your
   own traffic (`scripts/campaign/draftvocab.py`) or of public text (the GLM recipe's `bench/draftvocab_public.py`
   method on this tokenizer) can be used.
+- **The watchdog's stand-downs are 20 minutes, not ownership.** Two open issues on the actor side, both found in
+  review of the watchdog wave. The pair's Mac-side teardown touches only `WATCH_LEASE`, and a lease mutes the tick for
+  `WATCH_LEASE_MIN` (20 min), while the both-absent verdict is definitive on any exit code, a clean exit 0 included,
+  so a pair taken down by hand is relaunched once the lease ages
+  ([#6](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/6)); the stop marker is the ownership
+  transfer, and the teardown path does not write it. And `WORKER_CONFIG` is a knob whose two halves disagree: the
+  worker's launcher takes the profile's config, while every head-side read of the worker parses
+  `config/prod-zig.env`, so rank 1's record, log and supervisor pid land where the watchdog does not look
+  ([#5](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/5)).
