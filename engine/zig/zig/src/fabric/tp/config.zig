@@ -69,6 +69,10 @@ pub const Config = struct {
     /// plan socket this long before it blocks (TF_DSV41_PLAN_SPIN_US, 5,000); 0 (tcp, nccl, unset): it blocks at once.
     plan_spin_ns: u64 = 0,
     plan_pin: ?PlanPin = null,
+    /// TF_DSV41_FOLLOW_STALL_S: seconds a follower mid-plan waits for the leader's next plan frame before its
+    /// fail-fast (exit 70, the pair watchdog heals). 0 (unset): off. The follower's idle wait for its next plan
+    /// (nothing in flight) is never a stall, so an idle rank 1 beside a healthy rank 0 does not flap.
+    follow_stall_ns: u64 = 0,
 
     /// Reads every setting from `get` (the environment in `fromEnv`); unset names keep the defaults.
     pub fn parse(get: *const fn ([]const u8) ?[]const u8) Error!Config {
@@ -79,6 +83,7 @@ pub const Config = struct {
         c.port = try int(u16, get, "TF_TP_PORT", c.port, 1, 65535 - 8);
         c.link_port = try int(u16, get, "TF_DSV41_PLAN_PORT", c.port + 7, 1, 65535);
         c.connect_timeout_ns = try seconds(get, "TF_DSV41_PLAN_TIMEOUT", 300, 0.1, 86400);
+        c.follow_stall_ns = try seconds(get, "TF_DSV41_FOLLOW_STALL_S", 0, 0, 86400);
         c.device = try int(u32, get, "TF_TP_DEVICE", c.device, 0, 63);
         // prod.env's names (GLM53_TF_*) where ours are unset: the same meaning, ours win
         const backend = alias(get, "TF_COMM_BACKEND", "GLM53_TF_COMM_BACKEND");
@@ -252,6 +257,18 @@ test "bad settings are refused and the digest ignores the rank" {
     try std.testing.expectEqual(@as(usize, 1 << 20), (try Config.parse(&Fake.get)).roce_var_bytes);
     Fake.pairs = &.{.{ "TF_TP_ROCE_VAR_KB", "65536" }};
     try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+}
+
+test "TF_DSV41_FOLLOW_STALL_S: unset is off, seconds are honored, a negative is refused" {
+    Fake.pairs = &.{};
+    try std.testing.expectEqual(@as(u64, 0), (try Config.parse(&Fake.get)).follow_stall_ns);
+    Fake.pairs = &.{.{ "TF_DSV41_FOLLOW_STALL_S", "300" }};
+    try std.testing.expectEqual(300 * std.time.ns_per_s, (try Config.parse(&Fake.get)).follow_stall_ns);
+    Fake.pairs = &.{.{ "TF_DSV41_FOLLOW_STALL_S", "0" }};
+    try std.testing.expectEqual(@as(u64, 0), (try Config.parse(&Fake.get)).follow_stall_ns);
+    Fake.pairs = &.{.{ "TF_DSV41_FOLLOW_STALL_S", "-5" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    Fake.pairs = &.{};
 }
 
 test "boot refuses any setting that asks for an RDMA write past 1 MiB" {

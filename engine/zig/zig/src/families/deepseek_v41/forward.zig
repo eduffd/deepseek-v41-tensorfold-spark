@@ -737,12 +737,17 @@ pub const Forward = struct {
         while (true) {
             const msg = try f.link.?.recvGrow(f.gpa, &buf);
             if (msg.len == 0) return error.BadPlan;
+            // mid-plan (TF_DSV41_FOLLOW_STALL_S arms the next frame's deadline): rank 1 has no round-end word from
+            // rank 0 (the plan link carries no ack), so the frames that free its slot are its own witness that the
+            // leader has work in flight; past them, its wait for the next plan is idle, not a stall.
+            f.link.?.mid_plan = true;
             const ended = f.followOp(msg, &ids, &prompt, &picks) catch |e| {
                 // Runner.guard failed the leader's same window before any launch: only its request fails
                 if (e != error.MissingTritonVariant) return e;
                 std.log.scoped(.dsv41).warn("rank {d}: operation {d} failed ({t}), as on rank 0: the next one", .{ f.comm.rank(), msg[0], e });
                 continue;
             };
+            if (msg[0] == op_keep or msg[0] == op_release or msg[0] == op_tree_drop) f.link.?.mid_plan = false;
             if (ended) return;
         }
     }

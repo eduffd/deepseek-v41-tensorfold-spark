@@ -67,6 +67,8 @@ pub const Session = struct {
         s.plan.spin_ns = cfg.plan_spin_ns;
         s.plan.pin = cfg.plan_pin;
         s.plan.avoid = cfg.roce_cpu;
+        s.plan.follow_stall_ns = cfg.follow_stall_ns;
+        if (cfg.rank != 0 and cfg.follow_stall_ns > 0) s.plan.stall = .{ .ctx = s, .call = planStall };
         if (cfg.failfast) {
             s.fate = Fate.init(cfg, b.release());
             s.fate.?.onFail(.{ .ctx = s, .call = abortHook });
@@ -169,6 +171,13 @@ pub const Session = struct {
     fn abortHook(ctx: *anyopaque, _: []const u8) void {
         const s: *Session = @ptrCast(@alignCast(ctx));
         s.comm().abort();
+    }
+
+    /// A follower mid-plan saw no plan frame for TF_DSV41_FOLLOW_STALL_S (planlink's deadline): the leader is wedged
+    /// inside the round it stopped announcing. This rank fails fast; the peer learns on the fate channel (exit 70).
+    fn planStall(ctx: *anyopaque, reason: []const u8) void {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        s.fatal(reason, error.PeerStalled);
     }
 
     /// The communicator the model uses: NCCL, or the hybrid route over the mailbox / RoCE.

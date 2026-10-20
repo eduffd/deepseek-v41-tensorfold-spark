@@ -3,6 +3,7 @@ const std = @import("std");
 const sock = @import("sock.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const fate = @import("fate.zig");
 const linux = std.os.linux;
 
 pub const max_ranks = 64;
@@ -33,6 +34,35 @@ pub const PlanLink = struct {
     pin: ?config.PlanPin = null,
     avoid: ?u32 = null,
     pinned: bool = false,
+    /// TF_DSV41_FOLLOW_STALL_S (config.follow_stall_ns): how long a follower waits for the next plan frame while
+    /// mid-plan before `stall` runs (rank 1 blind beside a wedged rank 0, fork issue #3). 0: off.
+    follow_stall_ns: u64 = 0,
+    /// rank 1: set from the frame it received until the leader's request ends on it (the `op_keep` / `op_release`
+    /// that frees the slot). The idle wait for the next plan (an empty queue, nothing in flight) is not a stall and
+    /// keeps its unbounded read.
+    mid_plan: bool = false,
+    /// the fail-fast for a frame that is late mid-plan (rank != 0, the knob on): tp's hook, ending the pair with 70
+    stall: ?fate.Hook = null,
+
+    /// The read's deadline: armed only mid-plan and with the knob on; null keeps the idle read blocking (an idle
+    /// follower beside an idle leader is its normal state, not a stall).
+    fn recvDeadline(p: *const PlanLink) ?u64 {
+        if (p.follow_stall_ns == 0 or !p.mid_plan) return null;
+        return sock.nowNs() + p.follow_stall_ns;
+    }
+
+    /// A read that ends the follower: a timeout mid-plan is the stall `stall` names (it exits 70 there); the rest is
+    /// the leader gone.
+    fn noPlan(p: *PlanLink, e: anyerror) Error {
+        if (e == error.Timeout) {
+            if (p.stall) |h| {
+                var buf: [128]u8 = undefined;
+                const why: []const u8 = std.fmt.bufPrint(&buf, "no plan frame from rank 0 for {d:.0} s mid-plan (TF_DSV41_FOLLOW_STALL_S)", .{@as(f64, @floatFromInt(p.follow_stall_ns)) / 1e9}) catch "no plan frame from rank 0 mid-plan";
+                h.call(h.ctx, why);
+            }
+        }
+        return error.PeerClosed;
+    }
 
     pub fn init(rank: u32, world: u32, fds: [max_ranks]sock.Fd) PlanLink {
         return .{ .rank = rank, .world = world, .fds = fds };
@@ -83,13 +113,13 @@ pub const PlanLink = struct {
         p.pinOnce();
         if (p.spin_ns > 0) p.spin();
         var len: u32 = undefined;
-        sock.recvExact(p.fds[0], std.mem.asBytes(&len), null) catch return error.PeerClosed;
+        sock.recvExact(p.fds[0], std.mem.asBytes(&len), p.recvDeadline()) catch |e| return p.noPlan(e);
         if (len % 8 != 0) return error.PeerClosed; // not a frame boundary: the stream is lost
         return len / 8;
     }
 
     fn body(p: *PlanLink, out: []i64) Error![]i64 {
-        sock.recvExact(p.fds[0], std.mem.sliceAsBytes(out), null) catch return error.PeerClosed;
+        sock.recvExact(p.fds[0], std.mem.sliceAsBytes(out), p.recvDeadline()) catch |e| return p.noPlan(e);
         p.received += 1;
         return out;
     }
@@ -98,7 +128,7 @@ pub const PlanLink = struct {
     fn drop(p: *PlanLink, n: usize) Error!void {
         var left: usize = n * 8;
         var scratch: [4096]u8 = undefined;
-        while (left > 0) : (left -= @min(left, scratch.len)) sock.recvExact(p.fds[0], scratch[0..@min(left, scratch.len)], null) catch return error.PeerClosed;
+        while (left > 0) : (left -= @min(left, scratch.len)) sock.recvExact(p.fds[0], scratch[0..@min(left, scratch.len)], p.recvDeadline()) catch |e| return p.noPlan(e);
     }
 
     /// Polls rank 0's socket until it is readable (or hung up) or `spin_ns` passed; the read that follows blocks.
@@ -185,6 +215,60 @@ fn capacity(cpu: u32) ?u32 {
     const n = linux.read(fd, &b, b.len);
     if (linux.errno(n) != .SUCCESS) return null;
     return std.fmt.parseInt(u32, std.mem.trim(u8, b[0..n], " \n"), 10) catch null;
+}
+
+/// rank 0's sending, late by `ms`: what a follower mid-plan waits for (TF_DSV41_FOLLOW_STALL_S).
+fn sendLate(link: *PlanLink, ms: u64) void {
+    sock.sleepNs(ms * std.time.ns_per_ms);
+    link.send(&.{ 0x504C414E, 7 }) catch {};
+}
+
+test "TF_DSV41_FOLLOW_STALL_S: a frame late mid-plan ends the read with the stall; the idle wait keeps blocking" {
+    const bootstrap = @import("bootstrap.zig");
+    const l = try bootstrap.testListener();
+    defer sock.close(l.fd);
+    const deadline = sock.nowNs() + 5 * std.time.ns_per_s;
+    const a = try sock.connect("localhost", l.port, deadline);
+    const b = try sock.accept(l.fd, deadline);
+    var f0: [max_ranks]sock.Fd = @splat(-1);
+    var f1: [max_ranks]sock.Fd = @splat(-1);
+    f0[1] = b;
+    f1[0] = a;
+    var lead = PlanLink.init(0, 2, f0);
+    defer lead.close();
+    var follow = PlanLink.init(1, 2, f1);
+    defer follow.close();
+    follow.follow_stall_ns = 40 * std.time.ns_per_ms;
+    var stalls: usize = 0;
+    const Stall = struct {
+        fn fire(ctx: *anyopaque, reason: []const u8) void {
+            const n: *usize = @ptrCast(@alignCast(ctx));
+            n.* += 1;
+            std.debug.assert(std.mem.indexOf(u8, reason, "no plan frame from rank 0") != null);
+        }
+    };
+    follow.stall = .{ .ctx = &stalls, .call = Stall.fire };
+    var buf: [8]i64 = undefined;
+    // mid-plan with nothing sent: the read returns inside the window, and the stall ran (a wedged rank 0, rank 1 blind)
+    follow.mid_plan = true;
+    const t0 = sock.nowNs();
+    try std.testing.expectError(error.PeerClosed, follow.recv(&buf));
+    const took = sock.nowNs() - t0;
+    try std.testing.expect(took >= 40 * std.time.ns_per_ms and took < 5 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(usize, 1), stalls);
+    // the idle state (nothing in flight): no deadline, so a frame sent past the window arrives (idle never flaps)
+    follow.mid_plan = false;
+    const snd = try std.Thread.spawn(.{}, sendLate, .{ &lead, 200 });
+    try std.testing.expectEqualSlices(i64, &.{ 0x504C414E, 7 }, try follow.recv(&buf));
+    snd.join();
+    try std.testing.expectEqual(@as(usize, 1), stalls);
+    // the knob off: a mid-plan read with no frame blocks (the shipped default keeps today's behavior)
+    follow.follow_stall_ns = 0;
+    follow.mid_plan = true;
+    const snd2 = try std.Thread.spawn(.{}, sendLate, .{ &lead, 60 });
+    try std.testing.expectEqualSlices(i64, &.{ 0x504C414E, 7 }, try follow.recv(&buf));
+    snd2.join();
+    try std.testing.expectEqual(@as(usize, 1), stalls);
 }
 
 test "plans arrive whole and in order; a closed rank 0 ends the follower" {
