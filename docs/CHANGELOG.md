@@ -50,6 +50,18 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   for a name the daemon cannot find, and rank 1 leaves on its own when its peer's stop ends its launcher, so a routine
   stop says nothing. `mount_words` quotes per argument, where one `%q` over the joined pair made a cache path with a
   space one unparseable argument for docker.
+- **The watchdog's start lock outlived the start** (this update, found by running the drills on the pair, 2026-10-20).
+  `take_lock` opens `$STATE_DIR/lock` as fd 8 of the acting shell, and bash children inherit open fds. The Zig start
+  launches its rank through `scripts/run-zig.sh --detached`, and that supervised loop lives as long as the rank does,
+  so the loop and the `docker run` client it spawns held the lock for the life of the container. Measured on the head:
+  `fuser` named `bash scripts/run-zig.sh 0 --detached` and its `docker run` as the holders, and every later
+  `scripts/serve.sh stop` answered `a start, a heal or a stop is running` with no marker written while
+  `scripts/serve.sh watch --once` answered the same row and stood down. That is a pair no human can stop, and a
+  watchdog that switched itself off right after the first heal it performed. The launcher closes fd 8 at its own entry
+  and `pair_launch` closes it on both spawn paths, so a launcher that outlives the change carries no lock. The suite
+  could not see this: its `docker` shim answers and exits, so no fixture launcher was ever alive to inherit the fd, and
+  a leg now holds a shim container up 12 s, finishes the start inside that window, and requires a stop and a tick to
+  get through while the launcher is alive.
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
   occurrence of an image, so an agent history that resends the same screenshot released it early; the next request
   with that image raised `KeyError` inside rank 0's prefill forward, rank 1 waited in the exchange, and both ranks

@@ -257,7 +257,10 @@ start_once() { # 0 ready; 1 failed; 2 canary failed; 3 short of slots
     drop_caches                                     # the canary's page cache out again
 }
 
-take_lock() { # one pair change at a time: a start, a heal's restart and a stop all take it, and none queues
+take_lock() { # one pair change at a time: a start, a heal's restart and a stop all take it, and none queues. fd 8 is
+    # inherited by every child this shell spawns, so anything meant to outlive the change closes it on its way in,
+    # which is what scripts/run-zig.sh does at its entry: a supervised loop holding the lock is a pair no human can
+    # stop and a watchdog standing down for the life of the rank.
     mkdir -p "$STATE_DIR"; exec 8>"$STATE_DIR/lock"
     flock -n 8 || { log "a start, a heal or a stop is running"; exit 1; }
 }

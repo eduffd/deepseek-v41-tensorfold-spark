@@ -122,7 +122,10 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
 }
 
 pair_launch() { # $1 = rank: launch it detached through scripts/run-zig.sh --detached, the way bin/up.sh does it (the
-    # ssh channel returns; the launcher lives on its node, into the durable log of its own state dir). Answer 0 once
+    # ssh channel returns; the launcher lives on its node, into the durable log of its own state dir). fd 8 closes on
+    # the way out: that is scripts/serve.sh take_lock's start lock, and a loop that outlives this start would carry it
+    # and keep the pair un-stoppable; scripts/run-zig.sh drops it at its own entry as well, so a loop launched by hand
+    # from a locked shell behaves the same. Answer 0 once
     # docker ps shows the container, 1 with the log tail when it never appears. rank 1 reads the config of its own
     # node, named here by path so a profile config (WORKER_CONFIG) reaches the worker's launcher. That knob splits the
     # witness chain today: worker_config_key and everything built on it parse the worker's config/prod-zig.env, so a
@@ -133,9 +136,9 @@ pair_launch() { # $1 = rank: launch it detached through scripts/run-zig.sh --det
         wdir=$(worker_state_dir); wconfig="$WORKER_REPO/${WORKER_CONFIG:-config/prod-zig.env}"
         [[ -n "$wdir" ]] || { log "rank 1: the worker's own config names no STATE_DIR, so its launcher has no log directory to launch into and no place to write its exit record: fix the worker's config"; return 1; }
         rank_log="$wdir/run-zig-r1.log"
-        wssh "mkdir -p '$wdir' && cd '$WORKER_REPO' && CONFIG='$wconfig' setsid nohup scripts/run-zig.sh 1 --detached >> '$rank_log' 2>&1 < /dev/null & sleep 1; exit 0" >/dev/null 2>&1 || true
+        wssh "mkdir -p '$wdir' && cd '$WORKER_REPO' && CONFIG='$wconfig' setsid nohup scripts/run-zig.sh 1 --detached >> '$rank_log' 2>&1 < /dev/null & sleep 1; exit 0" >/dev/null 2>&1 8>&- || true
     else
-        setsid nohup scripts/run-zig.sh 0 --detached >> "$STATE_DIR/run-zig-r0.log" 2>&1 < /dev/null &
+        setsid nohup scripts/run-zig.sh 0 --detached >> "$STATE_DIR/run-zig-r0.log" 2>&1 < /dev/null 8>&- &
     fi
     for _i in $(seq 1 15); do
         if [[ "$rank" == 1 ]]; then st=$(wssh "docker ps -a --filter name=$NAME-r1 -q" 2>/dev/null || true)

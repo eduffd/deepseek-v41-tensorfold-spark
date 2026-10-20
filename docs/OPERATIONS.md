@@ -184,6 +184,11 @@ counter, marker, log or heal folder is shared between them.
   alerted by name: from the head, rank 1 is unwatched, and half a pair answers `/health` 200 by itself. A worker that
   answers ssh and names no `STATE_DIR` in its own config is said the same way, on stderr beside a debounced bad tick:
   rank 1's record cannot be read, which is a config fault, not a rank with no death.
+- The start lock is fd 8 of the shell that took it, and bash children inherit open fds, so the launcher closes it at
+  its own entry and `pair_launch` closes it on both spawn paths. A supervised loop that carried it stands every later
+  tick down and refuses every later `stop` for the life of the rank: that is what the pair measured on 2026-10-20,
+  where `fuser $STATE_DIR/lock` named `bash scripts/run-zig.sh 0 --detached` and the `docker run` client it spawned as
+  the lock's holders. A lock held by a launcher is not "a start is running"; it is the actor switching itself off.
 - A start the canary refused is a pair stopped on purpose: the canary-failed start writes the stop marker, so the
   watchdog leaves the pair the canary rejected for the human to read (`$STATE_DIR/canary-fail-r0.log`,
   `canary-fail-r1.log`). A `stop` and a heal both take the start lock, non-blocking: neither queues behind a start it

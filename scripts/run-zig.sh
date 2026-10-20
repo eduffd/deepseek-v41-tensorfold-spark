@@ -12,6 +12,12 @@
 # One stack per pair: this refuses while its own rank's container exists.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# The watchdog's start lock is fd 8 of the shell that started this (scripts/serve.sh take_lock), and bash children
+# inherit open fds. A supervised loop outlives the start that launched it, so it drops the lock on its way in: a
+# launcher that carried it would keep the pair un-stoppable and the tick standing down for the life of the rank. The
+# test runs the close on a no-op first, because `exec 8>&-` on a closed fd is an error and `exec 8>&- 2>/dev/null`
+# would send this script's own stderr to /dev/null, where its refusal rows live.
+if : 8>&- 2>/dev/null; then exec 8>&-; fi
 rank=${1:?usage: run-zig.sh 0|1 [--dry-run|--check-aot|--detached]}
 [[ "$rank" == 0 || "$rank" == 1 ]] || { echo 'rank must be 0 or 1' >&2; exit 2; }
 config=${CONFIG:-config/prod-zig.env}

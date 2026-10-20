@@ -686,6 +686,31 @@ class TestHealYieldsToAStart(ShellCase):
         self.assertEqual(self.rig.state_file("stopped"), "", "a refused stop marks nothing")
         self.assertIn(r0, self.rig.get_world()["containers"], "the running pair is untouched")
 
+    def test_a_launcher_that_outlives_the_start_does_not_carry_the_lock(self) -> None:
+        """The start's lock is fd 8 of the shell that took it, and bash children inherit open fds. The Zig start
+        launches its rank through scripts/run-zig.sh --detached, and that loop lives as long as the rank does. On the
+        pair's head on 2026-10-20, `fuser $STATE_DIR/lock` named the loop and the `docker run` client it spawns as the
+        lock's holders, and every later `serve.sh stop` and `serve.sh watch --once` answered "a start, a heal or a
+        stop is running": a pair no human can stop, and a watchdog that switched itself off right after the first heal
+        it performed. Here the launched rank's container stays up 12 s, the start finishes inside that window, and the
+        operator's stop plus the next tick must both get through while the launcher is still alive."""
+        self.pair_down_fast(self.rig)
+        self.rig.write_config("zig")
+        self.rig.run_hold_s(12)
+
+        proc = self.rig.run(self.rig.serve, "start", timeout=180)
+        self.assertIn("serving on :8199", proc.stdout, f"the start completed: {proc.stdout}{proc.stderr}")
+
+        stop = self.rig.run(self.rig.serve, "stop")
+        self.assertNotIn("a start, a heal or a stop is running", stop.stdout,
+                         f"a launcher alive beside the pair holds nobody's lock: {stop.stdout}{stop.stderr}")
+        self.assertEqual(stop.returncode, 0, f"the operator's stop took effect ({stop.stdout}{stop.stderr})")
+        self.assertNotEqual(self.rig.state_file("stopped"), "", "the stop marked the pair stopped")
+
+        tick = self.rig.run(self.rig.serve, "watch", "--once")
+        self.assertNotIn("a start, a heal or a stop is running", tick.stdout,
+                         f"the tick keeps watching a pair whose launcher is alive: {tick.stdout}{tick.stderr}")
+
     def hold_lock(self, seconds: int) -> subprocess.Popen:
         holder = subprocess.Popen(["bash", "-c", f"exec 8>'{self.rig.state}/lock'; flock 8; sleep {seconds}"],
                                   env=self.rig.env())
