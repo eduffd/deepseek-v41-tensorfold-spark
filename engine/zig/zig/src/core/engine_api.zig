@@ -306,10 +306,14 @@ pub const prompt_imprint = @import("prompt_imprint.zig");
 /// The idle keepalive's ticker and target contract.
 pub const keepalive = @import("keepalive.zig");
 
+/// A round's stall clock, its report and its exit (stall.zig).
+pub const stall = @import("stall.zig");
+
 test {
     _ = @import("lane_host.zig");
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
+    _ = @import("stall.zig");
 }
