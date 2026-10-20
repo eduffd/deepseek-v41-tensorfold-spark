@@ -93,14 +93,29 @@ Serving safety, on by default (G16-G19):
 Host memory and stalls (G12; defaults in brackets):
 
 - `TF_DSV41_STALL_S` (300; 0 = off): a round that runs longer prints a stall report on both ranks (rank, round, phase,
-  the round's plan, the forward's waits, every thread's stack), again every 4x that. That printed report and
-  `TF_DSV41_STALL_EXIT_S` (0 = never, exit after that long in one round) exist in the vendor Python family only
-  (`stall.py`'s `Watch`). The Zig engine reads `TF_DSV41_STALL_S` for the `/health` `stalled[]` list (default 0), reads
-  `TF_DSV41_STALL_ROUND_S` (120) and `TF_DSV41_STALL_SLOW_S` (180) for the `/health` stall labels, and reads
-  `TF_DSV41_STALL_EXIT_S` nowhere. A wedged Zig round runs forever, so the pair's recovery is the watchdog's, not the
-  engine's (fork issue [eduffd/deepseek-v41-tensorfold-spark#1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1),
-  [KNOWN-ISSUES](KNOWN-ISSUES.md)). What the Zig pair does answer on its own is the fail-fast exit 70
-  (`TF_DSV41_FAILFAST`), and the watchdog heals that on its first tick.
+  the round's plan, the forward's waits, every thread's stack), again every 4x that. That printed report exists in the
+  vendor Python family only (`stall.py`'s `Watch`). The Zig engine reads `TF_DSV41_STALL_S` for the `/health`
+  `stalled[]` list (default 0), reads `TF_DSV41_STALL_ROUND_S` (120) and `TF_DSV41_STALL_SLOW_S` (180) for the `/health`
+  stall labels, and acts on the stall label itself (both knobs 0 = off, both default off):
+  - `TF_DSV41_STALL_EXIT_S` (rank 0): seconds the stall label — work in flight and no round ended for
+    `TF_DSV41_STALL_ROUND_S` — must keep holding before rank 0 prints one scoped warn line naming the age, the in-flight
+    count and the two knob values, and runs its own fail-fast: exit 70 over the fate channel, the same code
+    `TF_DSV41_FAILFAST` uses, which the watchdog heals on its first tick (at most every `WATCH_FF_MIN_HEAL`, 120 s).
+    The clock counts from the label first holding, so a pair that keeps finishing rounds — slow, never stopped — never
+    fires it, and a pair with nothing in flight never holds the label. With the engine's 120 s label and the 180 s
+    the recommended profile ships, rank 0 exits about 5 minutes from when the wedge began: the label at 120 s, the
+    knob's 180 s from the tick that first saw it, both the knobs' own arithmetic and not a measurement. The heal
+    lands on top of that, on the watchdog's first tick ("Watchdog and start at boot").
+  - `TF_DSV41_FOLLOW_STALL_S` (rank 1): seconds rank 1, mid-plan (past a plan frame it received, before the
+    `op_keep` / `op_release` that frees its slot), waits for rank 0's next plan frame before it fails fast the same way
+    (exit 70). Rank 1's idle wait for its next plan — nothing in flight — keeps its unbounded read: an idle rank 1
+    beside a healthy rank 0 is its normal state, not a stall (fork issue
+    [#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)). A rank parked inside a collective is not
+    this knob's shape; it covers the half of the pair that was blind.
+  With both off (the shipped default), a wedged Zig round runs forever and the pair's recovery is the watchdog's, not
+  the engine's (fork issue [#1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1),
+  [KNOWN-ISSUES](KNOWN-ISSUES.md)). What the Zig pair answers on its own is the fail-fast exit 70
+  (`TF_DSV41_FAILFAST`) and these two self-exits, and the watchdog heals that on its first tick.
 - `TF_DSV41_ENGRAM_WAIT_S` (300; 0 = none): deadline on an Engram read and on the Engram gate's worker.
 - `TF_DSV41_NUMPY_HUGEPAGE` (0): NumPy's huge-page request on its large buffers, off on the ranks.
 - `TF_DSV41_HOST_BUFFERS` (6): reused NumPy buffers for a prompt segment's Engram rows.

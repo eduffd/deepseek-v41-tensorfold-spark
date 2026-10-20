@@ -4,11 +4,16 @@
   rounds: `/health` answered 503 with the stall labels, `rounds_total` froze at 383,335, in-flight requests grew from 22
   to 24, rank 1's GPU sat at 96%, and clients saw a server that accepted work and answered nothing (evidence in
   `results/verify/20261019-213006/`). A round in flight never returns, rank 1 waits in the TP exchange, and nothing in
-  the engine ends it. The Zig engine has no stall self-exit (`TF_DSV41_STALL_EXIT_S` is implemented in the vendor
-  Python family only, [issue #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1)), no deadline on any
-  peer wait ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)), a watchdog on rank 0 that is
-  blind to a rank-1-side wedge ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)), and a mailbox
-  timeout that leaves stale buffers live
+  the engine ends it. It ends it now, on both ranks, off by default: `TF_DSV41_STALL_EXIT_S` (rank 0 — the `/health`
+  stall label, no round with work in flight, held that many seconds prints one warn line naming it and runs the
+  engine's own fail-fast, exit 70) and `TF_DSV41_FOLLOW_STALL_S` (rank 1 — a plan frame late while rank 1 is mid-plan
+  ends it the same way; its idle wait for its next plan is never a stall), the recommended profile arming them at
+  180 s / 300 s ([OPERATIONS](OPERATIONS.md) "Watchdog and start at boot"), which closes
+  [issue #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1) and the self-exit legs of
+  [#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3). The wedge itself is what stays open: a rank
+  parked inside a collective is not what either knob watches, peer waits still have no deadlines
+  ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)), rank 0's stall watchdog reads its own
+  host-side state only, and a mailbox timeout leaves stale buffers live
   ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)). That day's recovery was a human: stop the
   pair, start it again, ready in 122 s, about 80 minutes after the pair went dead. The self-heal watchdog
   ([OPERATIONS](OPERATIONS.md) "Watchdog and start at boot") bounds the outage instead. An engine-labelled 503 is a

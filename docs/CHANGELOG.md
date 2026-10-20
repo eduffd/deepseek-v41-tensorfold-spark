@@ -5,6 +5,26 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
 
 ## Bugs fixed
 
+- **A wedged Zig rank now exits 70 by itself** (this update, the stall self-exit on both ranks; the self-exit legs of
+  [issue #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1) and
+  [issue #3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)). `TF_DSV41_STALL_EXIT_S` (0 = off, the
+  shipped default) was implemented in the vendor Python family only; the Zig pair read it nowhere, and the
+  2026-10-19 / 2026-10-20 wedges ran to a human stop or to a probe burning ticks. Rank 0 now reads the verdict
+  `/health` already computes — work in flight and no round ended for `TF_DSV41_STALL_ROUND_S` — once a second on a
+  thread in the serve path; when that verdict has held for `TF_DSV41_STALL_EXIT_S` seconds it prints one warn line
+  naming the age, the in-flight count and both knobs, and runs the engine's own fail-fast (`fabric/tp/fate.zig`):
+  exit 70, the peer told on the fate channel, both ranks out within the `TF_DSV41_FAILFAST_GRACE_S` (1.0 s) grace,
+  and the pair healed on the watchdog's first tick, which the fail-fast witness path takes at most every
+  `WATCH_FF_MIN_HEAL` (120 s). `TF_DSV41_FOLLOW_STALL_S` (0 = off, default) arms rank 1's plan-link read while it is
+  mid-plan (past a plan frame, before the `op_keep` / `op_release` that frees its slot): a frame late by that many
+  seconds ends rank 1 the same way. Rank 1's idle wait for its next plan — nothing in flight — keeps its unbounded
+  read, so an idle rank 1 beside a healthy rank 0 does not flap. No collective is added and nothing runs inside the
+  round loop: rank 0 reads the same pace age and in-flight count `/health` reads, rank 1 passes a real deadline to
+  the recv it already makes. The verdict's states (idle, age under the label, held under the window, held past it, a
+  round completing, the knob off) and the plan-link deadline (mid-plan late, idle blocks, off blocks) are covered by
+  unit tests in `spark.zig`, `planlink.zig` and `config.zig`. The wedge's root cause is untouched
+  ([KNOWN-ISSUES](KNOWN-ISSUES.md)): these knobs turn "wedged for hours" into "exited 70, healed on the next tick",
+  the same arithmetic as the watchdog row above.
 - **A Zig pair that dies or wedges now restarts itself** (this update, the head-side watchdog on the Zig profile).
   `scripts/run-zig.sh` records `<code> <epoch> <boot_id>` in `$STATE_DIR/exit-r<rank>` on every invocation, so a
   `docker run --rm` rank's fail-fast exit 70 is a witnessed death and heals on the watchdog's first tick, at most once
