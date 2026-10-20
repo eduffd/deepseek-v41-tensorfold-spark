@@ -550,7 +550,7 @@ class TestHealYieldsToAStart(ShellCase):
 
         proc2 = self.rig.run(self.rig.serve, "watch", "--once")
 
-        self.assertEqual(self.rig.stdout_lines(proc2), ["[dsv41-tf] watch: a start is in progress; standing down"],
+        self.assertEqual(self.rig.stdout_lines(proc2), ["[dsv41-tf] watch: a start, a heal or a stop is running; standing down"],
                          f"a tick runs no second heal beside a heal: {proc2.stdout}{proc2.stderr}")
         self.assertEqual(self.rig.state_file("heals"), "1", "the second tick healed nothing")
 
@@ -565,7 +565,7 @@ class TestHealYieldsToAStart(ShellCase):
         holder.wait(30)
 
         self.assertEqual(proc.returncode, 1, f"the heal gives up on a held lock ({proc.stdout}{proc.stderr})")
-        self.assertIn("another start (or a watchdog heal) is running", proc.stdout, f"{proc.stdout}")
+        self.assertIn("a start, a heal or a stop is running", proc.stdout, f"{proc.stdout}")
         self.assertNotIn("tensorfold-zig-r0", self.rig.get_world()["containers"],
                          "the pair the human is starting stays as the human left it")
         self.assertEqual(self.rig.state_file("stopped"), "", "a refused heal marks nothing")
@@ -581,7 +581,7 @@ class TestHealYieldsToAStart(ShellCase):
         holder.wait(30)
 
         self.assertEqual(proc.returncode, 1, f"a stop races no start ({proc.stdout}{proc.stderr})")
-        self.assertIn("another start (or a watchdog heal) is running", proc.stdout, f"{proc.stdout}")
+        self.assertIn("a start, a heal or a stop is running", proc.stdout, f"{proc.stdout}")
         self.assertEqual(self.rig.state_file("stopped"), "", "a refused stop marks nothing")
         self.assertIn(r0, self.rig.get_world()["containers"], "the running pair is untouched")
 

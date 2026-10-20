@@ -228,8 +228,9 @@ class Rig:
     # -- the state dir the scripts share ------------------------------------------------------
 
     def state_file(self, name: str, content: str | None = None) -> str:
-        """One of the state dir's one-line dialect files (fails, last_heal, stopped, exit-r<rank>, heal.log).
-        Written with the newline `echo` gives, because serve.sh reads them with `read`."""
+        """One of the head state dir's one-line dialect files (fails, last_heal, stopped, exit-r0, heal.log). Rank 1's
+        record and pid file live in the worker's state dir (worker_state_file). Written with the newline `echo`
+        gives, because serve.sh reads them with `read`."""
         path = self.state / name
         if content is None:
             return path.read_text().strip() if path.exists() else ""
@@ -314,7 +315,7 @@ class Rig:
             (self.root / "scripts").symlink_to(ROOT / "scripts")
 
     def example_keys(self, example: Path = EXAMPLE_ZIG) -> dict:
-        """config/prod-zig.env.example as shipped, every placeholder filled with a fixture path: what an operator
+        """A shipped Zig example config as written, every placeholder filled with a fixture path: what an operator
         gets from `cp config/prod-zig.env.example config/prod-zig.env`. Only the test knobs (fixture ports, no
         canary, no memory gate, short timeouts, the context the fixture's rope.bin covers) are added, so a script
         that reads a key the example does not name fails here, not on a node."""

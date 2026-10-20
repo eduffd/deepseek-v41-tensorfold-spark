@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # The RECIPE=zig pair: the two containers scripts/run-zig.sh launches, tensorfold-zig-r0 (head, `tensorfold-dsv41
 # serve`, the API) and tensorfold-zig-r1 (worker, `tf-dsv41-m1 follow`, no HTTP surface). scripts/serve.sh sources
-# this after the config and calls five things: pair_required_keys, pair_exit <rank>, pair_launch <rank>,
-# pair_stop <grace_s>, pair_boot_decision. The ports (PORT, TF_TP_PORT), the head address (TF_TP_MASTER) and the
-# slot-line regex are config keys / derived values in serve.sh, not adapter calls.
-# pair_required_keys here and scripts/run-zig.sh's own key check list the same keys on purpose (each entry point
-# validates its own contract): a key change edits both, and this file is the one place the recipe's keys are named.
+# this after the config and calls the five pair calls: pair_required_keys, pair_exit <rank>, pair_launch <rank>,
+# pair_stop <grace_s>, pair_boot_decision, plus worker_config_key, the read of a key in the worker's own config that
+# no head-side key answers. The ports (PORT, TF_TP_PORT), the head address (TF_TP_MASTER) and the slot-line regex are
+# config keys / derived values in serve.sh, not adapter calls.
+# pair_required_keys here and scripts/run-zig.sh's own key check cover the same pair-facing keys on purpose (each
+# entry point validates its own contract; run-zig.sh needs no ssh keys, it is the local rank): a key change edits
+# both, and this file is the one place the recipe's keys are named.
 # The exit witness: this pair runs `docker run --rm --init`, so a rank leaves no container for docker inspect to
 # answer. scripts/run-zig.sh writes "$STATE_DIR/exit-r<rank>" as "<code> <epoch> <boot_id>" on every invocation, and
 # rank 1's record lives in the worker's own STATE_DIR, stamped with the worker's boot id: the pair's two nodes
@@ -76,8 +78,8 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
     # parsed here and only here, and the boot id is answered in the head's terms: the head's own when the death is
     # from this boot on the node the rank ran on, empty when it is from an earlier boot there. Rank 1 ran on the
     # worker, whose boot id is its own, and this adapter is the one place that knows which node a rank's witness
-    # lives on. One function, one fallback chain: the launcher's record, then the die event (a hand-run `docker run`
-    # or an earlyoom SIGKILL has no cooperating launcher, so it leaves the event and nothing else).
+    # lives on. The fallback to the die event is for a rank with no cooperating launcher (a hand-run `docker run`, an
+    # earlyoom SIGKILL), which leaves the event and nothing else.
     local rank=$1 rec code epoch rec_boot out t node_boot fmt ev since
     node_boot=$(boot_id)
     [[ "$rank" == 1 ]] && node_boot=$(worker_boot_id)

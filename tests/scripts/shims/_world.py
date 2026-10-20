@@ -56,6 +56,9 @@ FIELDS = (
 )
 
 
+# The fields `events.Message` answers, each measured on docker 29.8.2: `--format '{{.Time}}'` is accepted and the
+# CLI goes on to contact the daemon, while `{{.Source}}`, `{{.Nope}}` and `{{.Attributes.exitCode}}` are rejected
+# with exit 64, no output, and "can't evaluate field ... in type *events.Message".
 FIELDS_OK = ("Status", "ID", "Type", "Action", "Actor", "Time", "TimeNano")
 
 
@@ -82,21 +85,21 @@ def render(fmt, event):
 def events_op(world, argv):
     """docker events --format <tmpl> --filter event=die --filter container=<name> [--since X] [--until X].
 
-    The template is validated the way the CLI validates it: a leading `.Attributes` is not a field of
-    `events.Message` (the attributes hang off `.Actor`), and a bad template is exit 64 with no output. `--since` /
-    `--until` bound the window (a bare `<n>s` is relative to now, `0s` is now, an epoch or an RFC3339 stamp is
-    absolute), because the pair's witness chain anchors the die-event read to its own stop marker."""
+    The template is validated against the fields `events.Message` answers, and a template naming a field it does not
+    answer is exit 64 with no output, which is what the CLI's own check does. `--since` / `--until` bound the window
+    (a bare `<n>s` is relative to now, `0s` is now, an epoch or an RFC3339 stamp is absolute), because the pair's
+    witness chain anchors the die-event read to its own stop marker."""
     fmt, fmtflag = argv[0], argv[1] == "1"
     args = argv[2:]
     if fmtflag:
         for expr in re.findall(r"\{\{(.*?)\}\}", fmt):
             parts = expr.strip().strip(".").split(".")
-            if not re.fullmatch(r"[\w.]+", expr.strip()) or not expr.strip().startswith("."):
-                sys.stderr.write(f"template parsing error: template: output:1: syntax error: {expr}\n")
+            if not re.fullmatch(r"\.[\w.]+", expr.strip()):
+                sys.stderr.write(f"Error parsing format: template: :1:1: syntax error: {expr}\n")
                 return 64
             if parts[0] not in FIELDS_OK:
-                sys.stderr.write(f'template parsing error: template: output:1:{len(expr)}: can\'t evaluate field '
-                                 f'{parts[0]} in type *events.Message\n')
+                sys.stderr.write(f'Error parsing format: template: :1:2: executing "" at <{expr.strip()}>: '
+                                 f'can\'t evaluate field {parts[0]} in type *events.Message\n')
                 return 64
     since, until, want = None, None, []
     i = 0

@@ -22,7 +22,9 @@ A start does not build the CUDA extensions on purpose: `scripts/serve.sh build` 
 which compiles them into `CACHE_VOL` on both nodes with no weights loaded (a build next to ~100 GB of weights once
 took the worker to 1.26 GiB MemAvailable). Run `scripts/serve.sh prebuild` yourself after `PREBUILD=0 scripts/serve.sh
 build`, after deleting the cache volume, or before turning on a lever whose extension was never built. A start that
-finds an extension missing builds it at load time, slowly and beside the weights.
+finds an extension missing builds it at load time, slowly and beside the weights. This is the Python recipe's build
+step: the Zig recipe has no CUDA extensions, so `build` skips it and `prebuild` exits 2 naming the check the Zig
+profile has, `scripts/run-zig.sh <rank> --check-aot`.
 
 ## Knobs
 
@@ -35,7 +37,7 @@ over the file: `CONTEXT=196608 scripts/serve.sh restart`.
 | `TF_DSV41_PREFILL_CHUNK` / `_ROWS` | 2048 / 2048 | 1024 / 1024 (G16-G18 production: replay 32K 1,996 vs 2,310) |
 | `TF_DSV41_PREFILL_ADAPT` / `_ADAPT_GIB` | 1 (default) / 4.5: rank 0 steps each round's rows down (2,048 / 1,024 / 512, never below `_MIN` 512) when the tighter rank would keep less than this after the round's priced transient; back up with `_UP_GIB` (0.5) more | `_ADAPT=0`: fixed rows. The engine default `_ADAPT_GIB` (5) flaps on GB10 |
 | `TF_DSV41_PF_COPIES`, `TF_DSV41_MHC_PF` | 1, 1 (G17, same bits) | 0 |
-| `TF_DSV41_PF_DENSE` / `_TABLE` | `fused` / `/cache/pfdense-table.json` (G17, same bits; `scripts/serve.sh cache` puts `config/pfdense-table.json` there) | `off`. The table file must exist in the cache volume (a missing file fails the prefill); unset `_TABLE` for the engine's built-in tiles (+1.5-3.4% instead of +5.4-6.9%) |
+| `TF_DSV41_PF_DENSE` / `_TABLE` | `fused` / `/cache/pfdense-table.json` (G17, same bits; `scripts/serve.sh cache` puts `config/pfdense-table.json` there) | `off`. The table file must exist in the cache (the Python recipe's `CACHE_VOL`, the Zig profile's per-node `CACHE_DIR`; a missing file fails the prefill); unset `_TABLE` for the engine's built-in tiles (+1.5-3.4% instead of +5.4-6.9%) |
 | `TF_DSV41_FULL_CONE` | 1: `full` prefill runs the decoder only over its dependency cone (same bits as plain `full`) | 0 |
 | `TF_DSV41_INDEX_BUDGET_MIB` / `_STREAM_MIN` | 64 / 4096 (G16 memory cap, exact) | 256 / 16384 (+1.6 GiB of cached allocator segments in long prefills) |
 | `TF_DSV41_POOL_TOKENS` | 614400: the 4 slots share 614K tokens of KV (a request waits for pages, never refused) | unset: 4 x CONTEXT (+0.6 GiB a rank) |
@@ -56,7 +58,7 @@ over the file: `CONTEXT=196608 scripts/serve.sh restart`.
 | `TF_DSV41_PDL` | 0: must stay 0 with `DENSE_V3=1` (not bit-exact together; refused at boot) | |
 | `TF_DSV41_GRAPH_MODE` | `rows` | `mix`: C2 / C4 slower |
 | `TF_DSV41_ROUTER` | `gemv` | `fused` / `split` |
-| `GLM53_TF_COMM_BACKEND` | `roce` | `nccl` (-11% / -17%). A RoCE failure at run time writes `/cache/roce-failed` in the cache volume and the next start of both ranks uses NCCL; delete it to retry RoCE |
+| `GLM53_TF_COMM_BACKEND` | `roce` | `nccl` (-11% / -17%). A RoCE failure at run time writes `/cache/roce-failed` in the cache (`CACHE_VOL`, the Zig profile's `CACHE_DIR`) and the next start of both ranks uses NCCL; delete it to retry RoCE |
 | `CONTEXT` | 300000 (4 x 300K) | 196608 keeps both ranks further from their memory floor |
 | `TF_DSV41_THINKING` / `_DEFAULT_EFFORT` | 1 / `high` (75) | requests override |
 | `TF_DSV41_GRAMMAR` | 1 | 0: `response_format` and strict tools ignored |
@@ -165,7 +167,8 @@ counter, marker, log or heal folder is shared between them.
   record exists, which covers a hand-run `docker run` and an earlyoom SIGKILL, the `die` event is the witness:
   `WATCH_EXIT_LOOKBACK_S` (180 s) back, or from the last stop marker forward when there is one, so a death that stop
   answered is not read as this one. A witness from an earlier boot is an earlier boot's death, never this one's.
-- The tick stands down while a start runs (the lock), while rank 0 is loading (`WATCH_GRACE`), after a deliberate
+- The tick stands down while the start lock is held (a start, a heal's restart, a stop), while rank 0 is loading
+  (`WATCH_GRACE`), after a deliberate
   `scripts/serve.sh stop` in the same boot (the stop marker), when both ranks are absent with no witness and no marker
   (the pair never started on this node), and while `WATCH_LEASE` is fresh (`WATCH_LEASE_MIN` 20 min, re-touchable). The
   marker owns the human teardown, and only that. A worker that does not answer ssh is not counted either, and it is
