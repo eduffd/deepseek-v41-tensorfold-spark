@@ -34,6 +34,29 @@ pub fn chip(_: Allocator) ?[]const u8 {
     return null;
 }
 
+/// TF_DSV41_STALL_S / _EXIT_S (GLM53_TF_ first, as app.alias_knobs): the engine's own stall watch; null with `problem`.
+fn stallSettings(problem: *[]const u8) ?api.stall.Settings {
+    var s: api.stall.Settings = .{};
+    s.limit_s = stallKnob("STALL_S", 300, problem, "TF_DSV41_STALL_S / GLM53_TF_STALL_S: seconds, a number >= 0") orelse return null;
+    s.exit_s = stallKnob("STALL_EXIT_S", 0, problem, "TF_DSV41_STALL_EXIT_S / GLM53_TF_STALL_EXIT_S: seconds, a number >= 0") orelse return null;
+    return s;
+}
+
+fn stallKnob(comptime name: []const u8, default: f64, problem: *[]const u8, message: []const u8) ?f64 {
+    const raw = std.c.getenv("GLM53_TF_" ++ name) orelse std.c.getenv("TF_DSV41_" ++ name) orelse return default;
+    const t = std.mem.trim(u8, std.mem.span(raw), " \t");
+    if (t.len == 0) return default;
+    const x = std.fmt.parseFloat(f64, t) catch {
+        problem.* = message;
+        return null;
+    };
+    if (!std.math.isFinite(x) or x < 0) {
+        problem.* = message;
+        return null;
+    }
+    return x;
+}
+
 /// The engine for `o.dir`, or null with `problem` set (the native_engines contract).
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     if (!std.mem.eql(u8, o.model_type, "deepseek_v41")) {
@@ -44,7 +67,12 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = "TF_DSV41_ASSETS: the dir with rope.bin, engram-host.bin and aot/ (model.zig)";
         return null;
     });
-    const s = Served.open(gpa, io, o.dir, assets, o.drafts and model.draftsEnv(), o.context) catch |e| {
+    var stall_problem: []const u8 = "";
+    const ws = stallSettings(&stall_problem) orelse {
+        problem.* = try std.fmt.allocPrint(a, "the DeepSeek-V4.1 stall knobs: {s}", .{stall_problem});
+        return null;
+    };
+    const s = Served.open(gpa, io, o.dir, assets, o.drafts and model.draftsEnv(), o.context, ws) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the DeepSeek-V4.1 CUDA engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
         return null;
     };
@@ -77,7 +105,8 @@ pub const Served = struct {
     lookup: ?*lookup.Planner = null,
 
     /// Rank 0's engine over a loaded model (`drafts`: DSpark's pass, else serial windows through the same lanes).
-    pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64) !*Served {
+    /// `stall`: the engine's own round watch; a replay gate passes `api.stall.Settings.off`.
+    pub fn open(gpa: Allocator, io: std.Io, dir: []const u8, assets: []const u8, drafts: bool, context: ?i64, stall: api.stall.Settings) !*Served {
         const m = try model.Model.open(gpa, io, dir, assets, .{ .drafts = drafts, .own_prefill = model.ownPrefillEnv(), .layers = try model.layersEnv(gpa) });
         errdefer m.close();
         if (m.rank() != 0) return error.NotRankZero; // the other ranks run `tf-dsv41-m1 follow`
@@ -178,7 +207,9 @@ pub const Served = struct {
             s.host.proposers = .{ .ctx = pl, .make = makeLookup, .free = freeLookup };
             std.log.info("dsv41 lookup: Python's priced plan (min match {d}, up to {d} rows{s})", .{ ls.min_match, ls.max_rows, if (ls.lookup) "" else ", lookup off" });
         }
+        try s.host.startStall(stall, api.stall.exitNow, .{});
         try s.host.start();
+        errdefer s.host.stop(); // a later boot failure joins both threads
         if (s.gengine) |ge| ge.inner = s.host.engine();
         s.rec = Recorder.init(gpa, io, if (s.gengine) |ge| ge.engine() else s.host.engine());
         // TF_DSV41_IMAGES=native (vision_rows.zig): a request's images held from submit to its finished event
