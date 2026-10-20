@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# setsid(1) stand-in (macOS ships none): the detached heal only needs the command to run, not a new session.
+exec "$@"

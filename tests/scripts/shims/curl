@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# curl stand-in: answers /health and /v1/models from the fixture world, printing the -w form (the tick reads the
+# status code through it) and failing like curl does (-f on a 4xx/5xx answers 22, no connection answers 7).
+url=""; wflag=""; fail=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -w) wflag="$2"; shift 2 ;;
+        -m|-H|-d|--max-time|--connect-timeout|-o|--header|--data|-A|-U) shift 2 ;;
+        --fail) fail=1; shift ;;
+        --*) shift ;;
+        -*) [[ "$1" == *-f* ]] && fail=1; shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+exec python3 -I "$SHIM_DIR/_world.py" http "$FIXTURE" "$url" "$wflag" "$fail"

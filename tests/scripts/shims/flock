@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# flock(1) stand-in (macOS ships none): fcntl.flock over an inherited fd number or a file path, -n for non-blocking.
+exec python3 -I -c '
+import fcntl, os, sys, time
+
+args = sys.argv[1:]
+nb = bool(args) and args[0] == "-n"
+if nb:
+    args = args[1:]
+target, rest = args[0], args[1:]
+fd = int(target) if target.isdigit() else os.open(target, os.O_RDWR | os.O_CREAT, 0o644)
+flags = fcntl.LOCK_EX | (fcntl.LOCK_NB if nb else 0)
+while True:
+    try:
+        fcntl.flock(fd, flags)
+        break
+    except OSError:
+        if nb:
+            sys.exit(1)
+        time.sleep(0.2)
+if rest:
+    os.execvp(rest[0], rest)
+' "$@"

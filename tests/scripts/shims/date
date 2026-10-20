@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# GNU `date -d <iso> +%s` (rank 0's StartedAt / FinishedAt) for BSD date; every other form passes through.
+if [[ "${1:-}" == -d ]]; then
+    exec python3 -I -c '
+import datetime, sys
+
+raw = sys.argv[1]
+try:
+    stamp = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+except ValueError:
+    print(0)
+    sys.exit(0)
+if stamp.tzinfo is None:
+    stamp = stamp.replace(tzinfo=datetime.timezone.utc)
+epoch = (stamp - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)).total_seconds()
+print(int(epoch))
+' "$2"
+fi
+exec /bin/date "$@"

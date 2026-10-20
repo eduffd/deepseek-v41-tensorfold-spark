@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# docker stand-in: answers from the fixture world, never touching a real daemon.
+cmd="${1:-}"; [[ $# -gt 0 ]] && shift
+fmt=""; pos=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -f|--format) fmt="$2"; shift 2 ;;
+        -t|--type|--tail|-n) shift 2 ;;
+        --name|-v|-e|-p|-w|--entrypoint|--gpus|--ipc|--network|--device|--ulimit|--cap-add|--log-opt|--user|--shm-size|--restart|-H) shift 2 ;;
+        --*) shift ;;
+        -*) shift 2 ;;
+        *) pos+=("$1"); shift ;;
+    esac
+done
+last="${pos[$(( ${#pos[@]} - 1 ))]:-}"
+case "$cmd" in
+inspect) exec python3 -I "$SHIM_DIR/_world.py" inspect "$FIXTURE" "$fmt" "$last" ;;
+image)   exec python3 -I "$SHIM_DIR/_world.py" image "$FIXTURE" "$fmt" "$last" ;;
+logs)    exec python3 -I "$SHIM_DIR/_world.py" logs "$FIXTURE" "$last" ;;
+run)     exec python3 -I "$SHIM_DIR/_world.py" run "$FIXTURE" ;;
+info)    exec python3 -I "$SHIM_DIR/_world.py" info "$FIXTURE" ;;
+rm)      exec python3 -I "$SHIM_DIR/_world.py" rm "$FIXTURE" ;;
+stop)    exec python3 -I "$SHIM_DIR/_world.py" stop "$FIXTURE" ;;
+ps)      exit 0 ;;
+*)       exit 0 ;;
+esac

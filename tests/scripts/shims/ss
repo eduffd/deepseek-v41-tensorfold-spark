@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# ss stand-in: nothing is listening (the fixture ports are free).
+exit 1
