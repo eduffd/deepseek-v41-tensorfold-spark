@@ -444,7 +444,10 @@ class Rig:
             port.mkdir(parents=True, exist_ok=True)
             (port / "state").write_text("0: ACTIVE\n")
 
-    def tick(self, recipe: str = "python", **overrides) -> subprocess.CompletedProcess:
+    def tick_writing_config(self, recipe: str = "python", **overrides) -> subprocess.CompletedProcess:
+        """One tick, with the config written first: write_config(recipe, **overrides), then `serve.sh watch --once`.
+        A leg that has edited a config file itself (a worker's copy, a stripped key) runs the tick through run()
+        instead, so the config it set up is the config the scripts read."""
         self.write_config(recipe, **overrides)
         return self.run(self.serve, "watch", "--once")
 

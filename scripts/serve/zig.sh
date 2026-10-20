@@ -71,6 +71,9 @@ exit_lookback_since() { # the die-event window's start, printed as an epoch. doc
     # last human stop *on this boot*, because an event from before that stop is a death that stop already answered, not
     # this one. The marker's own boot id is the check: a stop from before the reboot says nothing about this boot's
     # pair, and anchoring on it would stretch the window across the reboot and read a pre-reboot death as this boot.
+    # The daemon's lower bound is inclusive, so the window cannot be the place that excludes the stop's own kills:
+    # mark_stopped stamps the marker one second after them, which leaves them out of the window and keeps the death a
+    # rank dies a beat behind its peer inside it, where classify answers it as the stop's.
     local mb mt now s
     read -r mb mt <<< "$(cat "$STATE_DIR/stopped" 2>/dev/null || true)"
     now=$(date +%s)
@@ -119,11 +122,14 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
 pair_launch() { # $1 = rank: launch it detached through scripts/run-zig.sh --detached, the way bin/up.sh does it (the
     # ssh channel returns; the launcher lives on its node, into the durable log of its own state dir). Answer 0 once
     # docker ps shows the container, 1 with the log tail when it never appears. rank 1 reads the config of its own
-    # node, named here by path so a profile config (WORKER_CONFIG) reaches the worker's launcher.
+    # node, named here by path so a profile config (WORKER_CONFIG) reaches the worker's launcher. That knob splits the
+    # witness chain today: worker_config_key and everything built on it parse the worker's config/prod-zig.env, so a
+    # profile here puts rank 1's record, log and pid file where the watchdog does not read (issue #5).
     local rank=$1 rank_log _i st wdir wconfig
     mkdir -p "$STATE_DIR"
     if [[ "$rank" == 1 ]]; then
         wdir=$(worker_state_dir); wconfig="$WORKER_REPO/${WORKER_CONFIG:-config/prod-zig.env}"
+        [[ -n "$wdir" ]] || { log "rank 1: the worker's own config names no STATE_DIR, so its launcher has no log directory to launch into and no place to write its exit record: fix the worker's config"; return 1; }
         rank_log="$wdir/run-zig-r1.log"
         wssh "mkdir -p '$wdir' && cd '$WORKER_REPO' && CONFIG='$wconfig' setsid nohup scripts/run-zig.sh 1 --detached >> '$rank_log' 2>&1 < /dev/null & sleep 1; exit 0" >/dev/null 2>&1 || true
     else
@@ -147,7 +153,9 @@ pair_stop() { # $1 = grace seconds: the bounded drain (rank 0 answers 503 and gi
     # inference from the state dir being unreadable: an empty answer is a config problem, and a pair stopped by
     # inference leaves rank 1's container up. A removal the worker's own daemon refuses is alerted, not swallowed: the
     # marker written after a stop makes the watchdog stand down beside a rank 1 that is still running, so the row is
-    # the only thing that says so.
+    # the only thing that says so. The alert requires the container to be seen after the failed removal: `docker rm
+    # -f` answers a non-zero rc for a name the daemon cannot find, and a rank 1 whose peer stopped leaves on its own
+    # (its launcher's fate plus --rm), so the return code alone says nothing about a container being left running.
     local grace=${1:-0} it gone=0 wrc=0 wdir
     # The supervisors first: a relaunched rank would come back a second after its container is removed.
     kill_supervisor head "$STATE_DIR/supervisor-r0.pid"
@@ -169,7 +177,7 @@ pair_stop() { # $1 = grace seconds: the bounded drain (rank 0 answers 503 and gi
         fi
     fi
     docker rm -f "$NAME-r0" >/dev/null 2>&1 || true
-    if (( wrc != 255 )) && ! wssh docker rm -f "$NAME-r1" >/dev/null 2>&1; then
+    if (( wrc != 255 )) && ! wssh docker rm -f "$NAME-r1" >/dev/null 2>&1 && wssh docker inspect "$NAME-r1" >/dev/null 2>&1; then
         alert "rank 1: docker rm -f failed on the worker: $NAME-r1 is left running, and the stop marker written after this says the pair is stopped"
     fi
 }

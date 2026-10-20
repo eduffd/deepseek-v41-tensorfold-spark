@@ -225,7 +225,15 @@ def main():
         verb = "rm" if op == "rm" else "stop"
         worker = os.environ.get("NODE_ROLE") == "worker"
         key = f"worker_docker_{verb}_rc" if worker else f"docker_{verb}_rc"
-        rc = int(world.get(key, world.get(f"docker_{verb}_rc", 0)))
+        forced = world.get(key, world.get(f"docker_{verb}_rc"))
+        missing = [n for n in sys.argv[3:] if n not in world["containers"]]
+        if missing and forced is None:
+            # A name the daemon cannot find is a non-zero answer with this row. The scripts depend on it being
+            # docker's answer and not a success, because `docker rm -f` is non-zero both when a daemon refuses a
+            # removal and when the container is already gone.
+            print(f"Error response from daemon: No such container: {missing[0]}", file=sys.stderr)
+            return 1
+        rc = int(forced or 0)
         if rc == 0:
             mutate(path, drop)
         return rc

@@ -54,7 +54,7 @@ class TestProbeGate(ShellCase):
         self.rig.health("200", IDLE_BODY)
         self.rig.completions("000", "")
 
-        proc = self.rig.tick("zig", WATCH_PROBE="1", WATCH_PROBE_S="2", WATCH_FAILS="3")
+        proc = self.rig.tick_writing_config("zig", WATCH_PROBE="1", WATCH_PROBE_S="2", WATCH_FAILS="3")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 3: probe " in line for line in lines),
@@ -69,7 +69,7 @@ class TestProbeGate(ShellCase):
         self.rig.health("200", IDLE_BODY)
         self.rig.completions("200", COMPLETION)
 
-        proc = self.rig.tick("zig", WATCH_PROBE="1", WATCH_PROBE_S="5")
+        proc = self.rig.tick_writing_config("zig", WATCH_PROBE="1", WATCH_PROBE_S="5")
 
         self.assertEqual(self.rig.stdout_lines(proc), [], f"a pair that answers the probe is healthy: {proc.stdout}{proc.stderr}")
         self.assertEqual(self.rig.state_file("fails"), "0", "an answered probe clears nothing, because it counted nothing")
@@ -80,7 +80,7 @@ class TestProbeGate(ShellCase):
         self.rig.container(r0); self.rig.container(r1)
         self.rig.health("200", BUSY_BODY)
 
-        proc = self.rig.tick("zig", WATCH_PROBE="1", WATCH_PROBE_S="2")
+        proc = self.rig.tick_writing_config("zig", WATCH_PROBE="1", WATCH_PROBE_S="2")
 
         self.assertEqual(self.rig.stdout_lines(proc), [], f"inflight 3 / queued 2 is traffic, not an idle pair: {proc.stdout}{proc.stderr}")
         self.assertEqual(self.rig.state_file("fails"), "0", f"{proc.stdout}{proc.stderr}")
@@ -91,10 +91,10 @@ class TestProbeGate(ShellCase):
         self.rig.container(r0); self.rig.container(r1)
         self.rig.health("200", IDLE_BODY)
         self.rig.completions("000", "")
-        self.rig.tick("zig", WATCH_PROBE="1", WATCH_PROBE_S="2", WATCH_PROBE_EVERY_S="120")
+        self.rig.tick_writing_config("zig", WATCH_PROBE="1", WATCH_PROBE_S="2", WATCH_PROBE_EVERY_S="120")
         stamp = self.rig.state_file("last_probe")
 
-        second = self.rig.tick("zig", WATCH_PROBE="1", WATCH_PROBE_S="2", WATCH_PROBE_EVERY_S="120")
+        second = self.rig.tick_writing_config("zig", WATCH_PROBE="1", WATCH_PROBE_S="2", WATCH_PROBE_EVERY_S="120")
 
         self.assertEqual(self.rig.stdout_lines(second), [], f"a probe every {120}s, not one per tick: {second.stdout}{second.stderr}")
         self.assertEqual(self.rig.state_file("last_probe"), stamp, "the throttle stamp is not rewritten by a skipped probe")
@@ -105,7 +105,7 @@ class TestProbeGate(ShellCase):
         self.rig.container(r0); self.rig.container(r1)
         self.rig.health("200", IDLE_BODY)
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
 
         self.assertEqual(self.rig.stdout_lines(proc), [], f"{proc.stdout}{proc.stderr}")
         self.assertEqual(self.rig.state_file("last_probe"), "", "no probe, no stamp")
@@ -126,7 +126,7 @@ class TestEvidenceBeforeTheStop(ShellCase):
     def test_the_heal_writes_its_verdict_health_logs_and_gpus_before_it_stops_the_pair(self) -> None:
         self.wedged_pair(self.rig)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1", WATCH_HEAL_GRACE="0")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1", WATCH_HEAL_GRACE="0")
         heal_log = self.run_to_ready(self.rig)
 
         self.assertIn("serving on :8199", heal_log, f"the heal must finish before the evidence is judged: {proc.stdout}")
@@ -158,7 +158,7 @@ class TestEvidenceBeforeTheStop(ShellCase):
         self.pair_down_fast(self.rig)
         self.rig.run_hold_s(2)
         for _ in range(2):
-            proc = self.rig.tick("zig", WATCH_HEAL="1", WATCH_EVIDENCE_KEEP="1", WATCH_FF_MIN_HEAL="0",
+            proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1", WATCH_EVIDENCE_KEEP="1", WATCH_FF_MIN_HEAL="0",
                                  WATCH_MAX_HEALS="9", WATCH_HEAL_GRACE="0")
             self.run_to_ready(self.rig)
             self.rig.state_file("last_heal", "0")
@@ -177,7 +177,7 @@ class TestHealCap(ShellCase):
         self.rig.state_file("heals", "5")
         self.rig.state_file("last_heal", "0")
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("5 heals in a row with no clean tick" in line and "WATCH_MAX_HEALS=5" in line
@@ -192,7 +192,7 @@ class TestHealCap(ShellCase):
         self.rig.state_file("heals", "9")
         self.rig.state_file("last_heal", "0")
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1", WATCH_MAX_HEALS="0")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1", WATCH_MAX_HEALS="0")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("restarting both ranks" in line for line in lines),
@@ -204,7 +204,7 @@ class TestHealCap(ShellCase):
         self.rig.health("200", IDLE_BODY)
         self.rig.state_file("heals", "5")
 
-        proc = self.rig.tick("zig")
+        proc = self.rig.tick_writing_config("zig")
 
         self.assertEqual(self.rig.state_file("heals"), "0", f"a clean tick is the reset: {proc.stdout}{proc.stderr}")
 
@@ -275,7 +275,7 @@ class TestRank1WitnessOverSsh(ShellCase):
         self.rig.absent(r1)
         self.rig.exit_record(1, "70", time.time() - 60)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: rank 1 absent (fail-fast exit 70)" in line for line in lines),
@@ -439,7 +439,7 @@ class TestDieEventWitness(ShellCase):
         self.rig.absent(r1)
         self.rig.die_event(r1, "70", 60)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: rank 1 absent (fail-fast exit 70)" in line for line in lines),
@@ -458,7 +458,7 @@ class TestDieEventWitness(ShellCase):
         self.rig.absent(r1)
         self.rig.die_event(r1, "70", 60)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
         self.assertTrue(any("rank 1 absent (fail-fast exit 70)" in line for line in lines),
                         f"the read answered: {lines} / {proc.stderr}")
@@ -543,7 +543,7 @@ class TestDieEventWindow(ShellCase):
         self.rig.marker(self.rig.boot, time.time() - 600)
         self.rig.die_event(r0, "137", 300)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: both ranks absent, exit witnesses from this boot (r0 137"
@@ -558,11 +558,59 @@ class TestDieEventWindow(ShellCase):
         self.rig.marker(self.rig.boot, time.time() - 300)
         self.rig.die_event(r0, "137", 600)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertEqual(lines, ["[dsv41-tf] watch: both ranks absent (stopped on purpose); standing down"],
                          f"an event from before the stop is a death the stop already answered: {lines} / {proc.stderr}")
+
+    def test_a_stop_witnesses_the_kill_it_caused_and_leaves_the_tick_standing_down(self) -> None:
+        """The shape of a human stop in whole seconds: the force kill at E, and mark_stopped's stamp at E + 1, one
+        second after it. The die-event window opens at the marker, so the kill the stop itself caused is outside it,
+        and the tick stands down."""
+        r0, r1 = self.rig.zig_names()
+        self.rig.absent(r0, r1)
+        kill = int(time.time() - 60)
+        self.rig.die_event(r0, "137", int(time.time()) - kill)
+        self.rig.marker(self.rig.boot, kill + 1)
+
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertEqual(lines, ["[dsv41-tf] watch: both ranks absent (stopped on purpose); standing down"],
+                         f"the stop's own kill is answered by the stop, not witnessed: {lines} / {proc.stderr}")
+
+    def test_a_stop_witnesses_the_record_its_kills_left_and_leaves_the_tick_standing_down(self) -> None:
+        """The same on the cooperating-launcher path: scripts/run-zig.sh writes rank 0's record when its `docker run`
+        returns, which is the stop's kill at E, and the marker follows at E + 1."""
+        r0, r1 = self.rig.zig_names()
+        self.rig.absent(r0, r1)
+        kill = int(time.time() - 60)
+        self.rig.exit_record(0, "137", kill)
+        self.rig.marker(self.rig.boot, kill + 1)
+
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertEqual(lines, ["[dsv41-tf] watch: both ranks absent (stopped on purpose); standing down"],
+                         f"a witness the stop itself caused is answered by that stop: {lines} / {proc.stderr}")
+
+    def test_a_rank_dying_a_beat_behind_its_peer_stands_the_tick_down_in_the_marker_s_second(self) -> None:
+        """The second the marker's stamp lands in is not empty: rank 1 follows rank 0's removal by a beat, and its die
+        event arrives inside it. The window answers that event, so the marker's comparison has to be inclusive at the
+        marker's own second, and a strict one here reads the pair's late death as a reason to heal a stopped pair."""
+        r0, r1 = self.rig.zig_names()
+        self.rig.absent(r0, r1)
+        kill = int(time.time() - 60)
+        self.rig.exit_record(0, "137", kill)
+        self.rig.die_event(r1, "137", int(time.time()) - (kill + 1))
+        self.rig.marker(self.rig.boot, kill + 1)
+
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertEqual(lines, ["[dsv41-tf] watch: both ranks absent (stopped on purpose); standing down"],
+                         f"a witness in the marker's own second is the stop's, not a heal: {lines} / {proc.stderr}")
 
     def test_a_marker_from_an_earlier_boot_is_no_anchor(self) -> None:
         """The marker the nodes carry is a file, so it outlives the boot that wrote it. Anchoring the window on it
@@ -573,7 +621,7 @@ class TestDieEventWindow(ShellCase):
         self.rig.marker("boot-before-the-reboot", time.time() - 300)
         self.rig.die_event(r0, "137", 240)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertEqual(len(lines), 1, f"one row, the reboot row, not a witness row: {lines} / {proc.stderr}")
@@ -595,7 +643,7 @@ class TestHealYieldsToAStart(ShellCase):
         self.pair_down_fast(self.rig)
         self.rig.run_hold_s(15)          # the launched rank stays up, so the heal is mid-start
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1", WATCH_FF_MIN_HEAL="0")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1", WATCH_FF_MIN_HEAL="0")
         lines = self.rig.stdout_lines(proc)
         self.assertTrue(any("restarting both ranks" in line for line in lines), f"the first tick launched the heal: {lines}")
 
@@ -725,6 +773,37 @@ class TestStopReachesTheWorker(ShellCase):
                       f"the container is really there, which is why the row is owed: {stop.stdout}")
         self.assertNotIn(r0, self.rig.get_world()["containers"],
                          f"the head's own removal still happened: {stop.stdout}")
+
+    def test_a_routine_stop_says_nothing_when_rank_1_left_with_its_peer(self) -> None:
+        """Rank 1 leaves on its own when its peer's stop ends its launcher (fate plus --rm), and `docker rm -f`
+        answers a non-zero rc for a name that is not there. An alert keyed on the rc alone prints the danger row on
+        every routine stop, and a row the operator learns to ignore is not a record of anything."""
+        self.rig.write_config("zig")
+        r0, r1 = self.rig.zig_names()
+        self.rig.container(r0)
+        self.rig.absent(r1)
+
+        stop = self.rig.run(self.rig.serve, "stop")
+        lines = self.rig.stdout_lines(stop) + stop.stderr.splitlines()
+
+        self.assertFalse(any("left running" in line for line in lines),
+                         f"nothing is left running, so the row is not owed: {stop.stdout}{stop.stderr}")
+        self.assertNotIn(r0, self.rig.get_world()["containers"], f"the head's removal still happened: {stop.stdout}")
+
+    def test_a_heal_names_the_worker_config_that_names_no_state_dir(self) -> None:
+        """The heal launches rank 1 into the log directory that node's own config names, and with no STATE_DIR there
+        the launch has nowhere to write. A heal that only reports the rank as gone sends the operator to the pair
+        when the fault is a config file."""
+        self.rig.write_config("zig", WATCH_HEAL="1", WATCH_FF_MIN_HEAL="0")
+        (self.rig.root / "config" / "prod-zig.env").write_text(
+            "".join(f"{line}\n" for line in (self.rig.root / "config" / "prod-zig.env").read_text().splitlines()
+                    if not line.startswith("STATE_DIR=")))
+        self.pair_down_fast(self.rig)
+
+        proc = self.rig.run(self.rig.serve, "watch", "--once")
+        out = self.rig.wait_for_state_file_containing("heal.log", "names no STATE_DIR", timeout=90)
+
+        self.assertIn("rank 1", out, f"the row names the rank the launch was for: {out} / {proc.stdout}")
 
 
 class TestZigRecipeVerbs(ShellCase):
