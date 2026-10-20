@@ -4,6 +4,7 @@ const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
 const pace_mod = @import("pace.zig");
+const stall_mod = @import("stall.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -76,6 +77,9 @@ pub const LaneHost = struct {
     closing: bool = false,
     /// the rounds' pace against their baseline, read by /health (under the mutex)
     pace: pace_mod.Pace = .{},
+    /// the stall watch `startStall` installed; never copied after start
+    watch: ?stall_mod.Watch = null,
+    round_no: u64 = 0, // engine thread only
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
     halt_reason: ?[]const u8 = null,
     thread: ?std.Thread = null,
@@ -148,7 +152,24 @@ pub const LaneHost = struct {
     }
 
     pub fn start(h: *LaneHost) !void {
+        errdefer h.stopStall();
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+    }
+
+    /// Installs the stall watch before `start` spawns the engine; both knobs off leaves the field null.
+    pub fn startStall(h: *LaneHost, settings: stall_mod.Settings, exit_fn: *const fn (u8) void, sink: stall_mod.Sink) !void {
+        if (!settings.on()) return;
+        h.watch = stall_mod.Watch.init(h.io, settings);
+        const w = &h.watch.?;
+        w.exit_fn = exit_fn;
+        w.sink = sink;
+        try w.start();
+    }
+
+    /// Stops and joins the watch; idempotent.
+    pub fn stopStall(h: *LaneHost) void {
+        if (h.watch) |*w| w.close();
+        h.watch = null;
     }
 
     /// Stops admitting, cancels what is left and joins the engine thread (after `halt`: the thread is gone already).
@@ -159,6 +180,7 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
         if (h.thread) |t| t.join();
         h.thread = null;
+        h.stopStall();
         h.queued.deinit(h.gpa);
         h.admitted.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
@@ -177,6 +199,7 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
         if (h.thread) |t| t.join();
         h.thread = null;
+        h.stopStall();
     }
 
     pub fn engine(h: *LaneHost) Engine {
