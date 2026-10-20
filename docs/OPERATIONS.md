@@ -159,13 +159,21 @@ counter, marker, log or heal folder is shared between them.
 - The two recipes witness a rank's exit differently, and only the recipe knows which. The Python pair's containers
   persist, so `docker inspect` answers their exit code and finish time. The Zig pair runs `docker run --rm`, so a rank
   leaves no container to inspect. `scripts/run-zig.sh` writes `<code> <epoch> <boot_id>` to `$STATE_DIR/exit-r<rank>`
-  on every invocation, rank 1's record living on the worker's own `STATE_DIR`. When no record exists, which covers a
-  hand-run `docker run` and an earlyoom SIGKILL, the `die` event inside `WATCH_EXIT_LOOKBACK_S` (180 s) is the witness.
-  A witness from an earlier boot is an earlier boot's death, never this one's.
+  on every invocation, rank 1's record living on the worker's own `STATE_DIR` and stamped with the *worker's* boot id:
+  the two nodes reboot independently, and rank 1's death belongs to its node's boot, never the head's. The adapter
+  compares each rank's record with the boot of the node it ran on and answers the tick in the head's terms. When no
+  record exists, which covers a hand-run `docker run` and an earlyoom SIGKILL, the `die` event is the witness:
+  `WATCH_EXIT_LOOKBACK_S` (180 s) back, or from the last stop marker forward when there is one, so a death that stop
+  answered is not read as this one. A witness from an earlier boot is an earlier boot's death, never this one's.
 - The tick stands down while a start runs (the lock), while rank 0 is loading (`WATCH_GRACE`), after a deliberate
   `scripts/serve.sh stop` in the same boot (the stop marker), when both ranks are absent with no witness and no marker
   (the pair never started on this node), and while `WATCH_LEASE` is fresh (`WATCH_LEASE_MIN` 20 min, re-touchable). The
-  marker owns the human teardown, and only that.
+  marker owns the human teardown, and only that. A worker that does not answer ssh is not counted either, and it is
+  alerted by name: from the head, rank 1 is unwatched, and half a pair answers `/health` 200 by itself.
+- A start the canary refused is a pair stopped on purpose: the canary-failed start writes the stop marker, so the
+  watchdog leaves the pair the canary rejected for the human to read (`$STATE_DIR/canary-fail-r0.log`,
+  `canary-fail-r1.log`). A `stop` and a heal both take the start lock, non-blocking: neither queues behind a start it
+  would race, and each says so in its log.
 - A heal counts. `WATCH_MAX_HEALS` (5) consecutive heals with no clean tick between them alert and stop healing
   (`0` turns the cap off); a clean tick resets the count in `$STATE_DIR/heals`. A pair that keeps coming back wedged
   needs a human look, not a sixth restart.
@@ -176,7 +184,9 @@ counter, marker, log or heal folder is shared between them.
 - The idle probe (`WATCH_PROBE=1`) is one tiny greedy completion, asked only when a 200 `/health` body reports
   `inflight` 0 and `queued` 0, at most every `WATCH_PROBE_EVERY_S` (120 s), waiting `WATCH_PROBE_S` (120 s) for the
   answer. A timeout is one debounced bad tick. It exists for the state no engine signal reports, a wedged rank 1
-  beside an idle rank 0. Off by default.
+  beside an idle rank 0. Its cost is one 8-token completion per idle pair every two minutes, and a completion that
+  never arrives is healed only after `WATCH_FAILS` of them. The scripts' default is off; both shipped Zig profiles set
+  it on, since the idle wedge is the family the incident log has and the engine cannot report.
 - `scripts/serve.sh heal` prints what to read after a heal: the last heal and its age, `fails`, the consecutive heal
   count, the lease and lock state, both exit witnesses, the stop marker, the `heal.log` tail and both ranks' log tails.
   `WATCH_ALERT=<cmd>` is called with the text of every alert.
@@ -200,6 +210,8 @@ counter, marker, log or heal folder is shared between them.
 - On the Zig profile, each node's `STATE_DIR` also holds that rank's launcher files: `exit-r<rank>` (the exit witness,
   one line `<code> <epoch> <boot_id>`, written on every `scripts/run-zig.sh` invocation), `run-zig-r<rank>.log` (the
   durable rank log a `--detached` launch appends to, capped at the newest 8 launch sections) and
-  `supervisor-r<rank>.pid` (the pid of a `--detached` loop, which `scripts/serve.sh stop` ends: a stop that left the
-  loop alive would relaunch the rank it was asked to keep down). A `--rm` container has no `docker logs` after it
-  exits, so these are the rank's own record of its last boots.
+  `supervisor-r<rank>.pid` (the pid of a `--detached` loop, which `scripts/serve.sh stop` ends by its process group: a
+  stop that left the loop alive would relaunch the rank it was asked to keep down, and a kill that missed the launch
+  in flight leaves that launch running). The loop deletes the pid file as it exits, and a second `--detached` on a
+  rank whose loop is live is refused. A `--rm` container has no `docker logs` after it exits, so these are the rank's
+  own record of its last boots.
