@@ -8,12 +8,13 @@ Every assertion is a log line or a state file a maintainer reads on the node.
 """
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
-from conftest import Rig
+from conftest import EXAMPLE_FLASH17, EXAMPLE_ZIG, Rig
 
 IDLE_BODY = '{"ok":true,"rounds_total":383335,"inflight":0,"queued":0}'
 STALLED_BODY = ('{"ok":false,"status":"stalled","stall_reason":"no round for 4772 s with work in flight",'
@@ -297,16 +298,27 @@ class TestLauncherRules(ShellCase):
         self.assertEqual(self.rig.state_file("exit-r1"), "", "a refusal launches nothing, so it leaves no witness")
 
     def test_detached_launch_records_the_exit_and_bounds_its_log(self) -> None:
-        """The durable rank log is what a heal reads tails of, so it keeps the newest launch sections and no more."""
+        """The durable rank log is what a heal reads tails of, so it keeps the newest launch sections and no more.
+        Rank 1 runs on the worker, on the worker's config, so its record and log land in the worker's state dir."""
         self.rig.write_config("zig")
         self.rig.make_zig_dirs()
         seeded = "".join(f"{SECTION}{i} ===\nsection {i}\n" for i in range(1, 10))
-        self.rig.state_file("run-zig-r1.log", seeded)
+        (self.rig.worker_state / "run-zig-r1.log").write_text(seeded)
         self.rig.run_rc(137)
 
-        proc = self.rig.run(self.rig.run_zig, "1", "--detached")
-        record = self.rig.wait_for_state_file_containing("exit-r1", "137", timeout=30)
-        log = self.rig.wait_for_state_file_containing("run-zig-r1.log", "=== run-zig rank 1 202", timeout=30)
+        proc = self.rig.run_as_worker(self.rig.run_zig, "1", "--detached")
+
+        def worker_state(name: str, needle: str) -> str:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                text = self.rig.worker_state_file(name)
+                if needle in text:
+                    return text
+                time.sleep(0.25)
+            return self.rig.worker_state_file(name)
+
+        record = worker_state("exit-r1", "137")
+        log = worker_state("run-zig-r1.log", "=== run-zig rank 1 202")
         self.rig.run_rc(0)          # the loop's next launch exits clean, which ends it (the pair watchdog owns 0 and 70)
 
         self.assertEqual(proc.returncode, 0, f"--detached returns at once and leaves the loop running: {proc.stdout}{proc.stderr}")
@@ -387,17 +399,45 @@ class TestShippedZigConfig(ShellCase):
         self.assertEqual(proc.returncode, 0, f"the shipped config shape must pass the gate the heal runs ({proc.stdout}{proc.stderr})")
         self.assertIn("preflight ok (static)", proc.stdout, f"{proc.stdout}")
 
+    def test_the_recommended_profile_passes_the_same_gate(self) -> None:
+        """config/prod-zig-flash17.env.example is the profile the docs recommend, so the heal's gate has to answer it,
+        not only the rollback profile."""
+        self.rig.write_example_config(example=EXAMPLE_FLASH17)
+        self.rig.make_roce_active()
+
+        proc = self.rig.run(self.rig.serve, "preflight", "static")
+
+        self.assertEqual(proc.returncode, 0, f"the recommended profile must pass the gate the heal runs ({proc.stdout}{proc.stderr})")
+        self.assertIn("preflight ok (static)", proc.stdout, f"{proc.stdout}")
+
+    def test_both_shipped_profiles_ship_the_supervision_keys(self) -> None:
+        """A profile that names no RECIPE is the Python pair, and a profile with no WATCH_* keys is a pair nobody
+        watches. Both shipped Zig examples carry the supervision block, with the name the launcher uses."""
+        keys = ("RECIPE", "NAME", "WORKER_SSH", "WORKER_REPO", "WATCH_HEAL", "WATCH_FAILS", "WATCH_HEAL_GRACE",
+                "WATCH_MAX_HEALS", "WATCH_EVIDENCE_KEEP", "WATCH_LEASE", "WATCH_LEASE_MIN", "WATCH_PROBE",
+                "WATCH_EXIT_LOOKBACK_S", "BOOT_LEASE")
+        for example in (EXAMPLE_ZIG, EXAMPLE_FLASH17):
+            with self.subTest(example=example.name):
+                shipped = Rig(Path(tempfile.mkdtemp())).example_keys(example)
+                self.assertEqual([k for k in keys if k not in shipped], [], f"{example.name} names none of these")
+                self.assertEqual(shipped["RECIPE"], "zig", f"{example.name}")
+                self.assertEqual(shipped["NAME"], "tensorfold-zig",
+                                 f"{example.name}: scripts/run-zig.sh launches tensorfold-zig-r0 and -r1")
+                self.assertGreaterEqual(int(shipped["WATCH_HEAL_GRACE"]), int(shipped["TF_DSV41_DRAIN_S"]),
+                                        f"{example.name}: the drain window is not shorter than the engine's own drain")
+
 
 class TestDieEventWitness(ShellCase):
     def test_a_die_event_answered_in_epoch_seconds_keeps_the_first_tick_heal(self) -> None:
-        """`docker events --format '{{.Time}} {{.Attributes.exitCode}}'` answers epoch seconds, not a timestamp
-        string. The die event is the 70's only witness for a pair launched by hand (no cooperating launcher), so its
-        epoch must reach the tick's boot / newer-than-the-last-heal comparison intact, not collapse to 0 and ride
-        WATCH_FAILS."""
+        """The die-event read is the 70's only witness for a pair launched by hand (no cooperating launcher), so the
+        read must answer on this Docker: `events.Message` carries the exit code under `.Actor.Attributes`, and the
+        CLI validates the template and prints nothing when it cannot resolve it. `.Time` answers epoch seconds, and
+        that epoch must reach the tick's boot / newer-than-the-last-heal comparison intact, not collapse to 0 and
+        ride WATCH_FAILS."""
         r0, r1 = self.rig.zig_names()
         self.rig.container(r0)
         self.rig.absent(r1)
-        self.rig.die_event(r1, "70", 60, dialect="epoch")
+        self.rig.die_event(r1, "70", 60)
 
         proc = self.rig.tick("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
@@ -413,35 +453,224 @@ class TestSupervisedRank(ShellCase):
         """`--detached` self-relaunches a rank that died alone, which is what keeps a half-up pair up. A human
         `serve.sh stop` must end that loop, not leave it re-launching the rank behind the stop, and it ends the loop
         by the pid the loop records: a command-line pattern matches the ssh shell carrying it, which reads back as a
-        worker that is unreachable."""
+        worker that is unreachable. It takes the loop's process group, because a loop killed while its launch is in
+        flight leaves that launch running and the rank comes back behind the stop."""
         self.rig.write_config("zig")
         self.rig.make_zig_dirs()
         self.rig.run_rc(137)
         self.rig.run_hold_s(1)
 
-        launched = self.rig.run(self.rig.run_zig, "1", "--detached")
+        launched = self.rig.run_as_worker(self.rig.run_zig, "1", "--detached")
         self.assertEqual(launched.returncode, 0, f"--detached returns at once ({launched.stdout}{launched.stderr})")
-        first = self.rig.wait_for_state_file_containing("exit-r1", "137", timeout=30).split()
+        deadline = time.time() + 30
+        while time.time() < deadline and not self.witness(1):
+            time.sleep(0.25)
+        first = self.witness(1)
         self.assertEqual(len(first), 3, f"the supervised launch writes its witness: {first!r}")
+        self.assertEqual(first[2], self.rig.worker_boot,
+                         f"the witness is stamped with the boot of the node the rank ran on: {first!r}")
         epoch = int(first[1])
         deadline = time.time() + 30
-        while time.time() < deadline and int(self.rig.state_file("exit-r1").split()[1]) == epoch:
+        while time.time() < deadline and int(self.witness(1)[1]) == epoch:
             time.sleep(0.5)
-        self.assertGreater(int(self.rig.state_file("exit-r1").split()[1]), epoch,
+        self.assertGreater(int(self.witness(1)[1]), epoch,
                            "the loop is live: it relaunched the rank that died alone")
-        self.assertNotEqual(self.rig.state_file("supervisor-r1.pid"), "",
+        self.assertNotEqual(self.rig.worker_state_file("supervisor-r1.pid"), "",
                             "the loop records the pid a stop has to end")
+
+        second = self.rig.run_as_worker(self.rig.run_zig, "1", "--detached")
+        self.assertEqual(second.returncode, 1,
+                         f"a second supervised loop on the same rank is refused, not a second pair: {second.stdout}{second.stderr}")
+        self.assertIn("supervised loop", second.stderr, f"name the loop that owns the rank: {second.stderr}")
 
         stop = self.rig.run(self.rig.serve, "stop")
         self.assertEqual(stop.returncode, 0, f"{stop.stdout}{stop.stderr}")
-        epoch = int(self.rig.state_file("exit-r1").split()[1])
-        self.assertEqual(self.rig.state_file("supervisor-r1.pid"), "", "a stop consumes the pid it killed")
+        epoch = int(self.witness(1)[1])
+        self.assertEqual(self.rig.worker_state_file("supervisor-r1.pid"), "", "a stop consumes the pid it killed")
         time.sleep(8)      # longer than the loop's 5 s relaunch
 
-        self.assertEqual(int(self.rig.state_file("exit-r1").split()[1]), epoch,
+        self.assertEqual(int(self.witness(1)[1]), epoch,
                          "no relaunch after the stop: the witness stopped moving")
         self.assertNotIn("tensorfold-zig-r1", self.rig.get_world()["containers"],
                          "a stopped rank stays down")
+
+    def witness(self, rank: int) -> list[str]:
+        state = self.rig.worker_state_file(f"exit-r{rank}") if rank == 1 else self.rig.state_file(f"exit-r{rank}")
+        return state.split()
+
+
+class TestDieEventWindow(ShellCase):
+    """The die-event read is bounded by the pair's own stop marker, not only by a fixed lookback: a death after a
+    human stop is this death, and a death the stop already answered is not."""
+
+    def test_a_death_after_an_old_stop_is_witnessed(self) -> None:
+        r0, r1 = self.rig.zig_names()
+        self.rig.absent(r0, r1)
+        self.rig.marker(self.rig.boot, time.time() - 600)
+        self.rig.die_event(r0, "137", 300)
+
+        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertTrue(any("watch: bad tick 1 of 1: both ranks absent, exit witnesses from this boot (r0 137"
+                            in line for line in lines),
+                        f"a pair death witnessed on this boot is definitive, and the marker is older than it: "
+                        f"{lines} / {proc.stderr}")
+        self.assertFalse(any("standing down" in line for line in lines), f"{lines}")
+
+    def test_a_death_the_stop_answered_is_no_witness(self) -> None:
+        r0, r1 = self.rig.zig_names()
+        self.rig.absent(r0, r1)
+        self.rig.marker(self.rig.boot, time.time() - 300)
+        self.rig.die_event(r0, "137", 600)
+
+        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertEqual(lines, ["[dsv41-tf] watch: both ranks absent (stopped on purpose); standing down"],
+                         f"an event from before the stop is a death the stop already answered: {lines} / {proc.stderr}")
+
+
+class TestHealYieldsToAStart(ShellCase):
+    """A start holds the lock for its whole run, and a heal that queued on that lock would stop the pair the human is
+    mid-start on. The tick gives up when the lock is held, and the heal it launches takes the lock the same way:
+    never queued. The fixture cannot schedule a start into the gap between a tick's check and its launch, so these
+    are the two ends of the rule, each deterministic."""
+
+    def test_a_tick_during_a_heal_stands_down(self) -> None:
+        """A heal is a start: it owns the pair from its stop to its ready. A second tick must not stack a heal on it."""
+        self.pair_down_fast(self.rig)
+        self.rig.run_hold_s(15)          # the launched rank stays up, so the heal is mid-start
+
+        proc = self.rig.tick("zig", WATCH_HEAL="1", WATCH_FF_MIN_HEAL="0")
+        lines = self.rig.stdout_lines(proc)
+        self.assertTrue(any("restarting both ranks" in line for line in lines), f"the first tick launched the heal: {lines}")
+
+        time.sleep(2)                    # the heal has its lock and its launch in flight by now
+
+        proc2 = self.rig.run(self.rig.serve, "watch", "--once")
+
+        self.assertEqual(self.rig.stdout_lines(proc2), ["[dsv41-tf] watch: a start is in progress; standing down"],
+                         f"a tick runs no second heal beside a heal: {proc2.stdout}{proc2.stderr}")
+        self.assertEqual(self.rig.state_file("heals"), "1", "the second tick healed nothing")
+
+    def test_a_heal_that_finds_the_lock_held_says_so_and_touches_nothing(self) -> None:
+        """The heal's restart takes the lock non-blocking. Queuing behind a human start is not what it does: it says
+        so in heal.log and leaves the pair the human is starting alone."""
+        self.pair_down_fast(self.rig)
+        holder = self.hold_lock(25)
+
+        proc = self.rig.run(self.rig.serve, "restart",
+                             env_extra={"DSV41_TF_HEAL": "1", "DSV41_TF_GRACE": "0", "CANARY": "off"})
+        holder.wait(30)
+
+        self.assertEqual(proc.returncode, 1, f"the heal gives up on a held lock ({proc.stdout}{proc.stderr})")
+        self.assertIn("another start (or a watchdog heal) is running", proc.stdout, f"{proc.stdout}")
+        self.assertNotIn("tensorfold-zig-r0", self.rig.get_world()["containers"],
+                         "the pair the human is starting stays as the human left it")
+        self.assertEqual(self.rig.state_file("stopped"), "", "a refused heal marks nothing")
+
+    def test_a_stop_under_a_held_lock_refuses_and_writes_no_marker(self) -> None:
+        """`stop` is the human's word that the pair is down on purpose. Run it while a start owns the pair and it
+        would stop that start's containers and mark the pair stopped on a node mid-boot."""
+        r0, r1 = self.rig.zig_names()
+        self.rig.container(r0); self.rig.container(r1)
+        holder = self.hold_lock(25)
+
+        proc = self.rig.run(self.rig.serve, "stop")
+        holder.wait(30)
+
+        self.assertEqual(proc.returncode, 1, f"a stop races no start ({proc.stdout}{proc.stderr})")
+        self.assertIn("another start (or a watchdog heal) is running", proc.stdout, f"{proc.stdout}")
+        self.assertEqual(self.rig.state_file("stopped"), "", "a refused stop marks nothing")
+        self.assertIn(r0, self.rig.get_world()["containers"], "the running pair is untouched")
+
+    def hold_lock(self, seconds: int) -> subprocess.Popen:
+        holder = subprocess.Popen(["bash", "-c", f"exec 8>'{self.rig.state}/lock'; flock 8; sleep {seconds}"],
+                                  env=self.rig.env())
+        time.sleep(1.5)
+        return holder
+
+
+class TestCanaryRefusalStandsDown(ShellCase):
+    def test_a_canary_failed_start_marks_the_pair_stopped(self) -> None:
+        """The canary is the human's gate: a pair that fails it is a pair the operator must look at, and the
+        watchdog relaunching it every tick is the actor answering a verdict that is not its own."""
+        self.rig.write_config("python", CANARY="strict")
+        self.rig.completions("500", '{"detail":"Internal Server Error"}')
+        self.rig.run_hold_s(2)
+
+        proc = self.rig.run(self.rig.serve, "start", timeout=180)
+
+        self.assertEqual(proc.returncode, 1, f"CANARY=strict fails the start ({proc.stdout}{proc.stderr})")
+        self.assertIn("canary failed", proc.stdout, f"{proc.stdout}{proc.stderr}")
+        self.assertNotEqual(self.rig.state_file("stopped"), "",
+                            "a start the canary refused is a pair stopped on purpose")
+
+        tick = self.rig.run(self.rig.serve, "watch", "--once")
+        lines = self.rig.stdout_lines(tick)
+        self.assertTrue(any("both ranks absent (stopped on purpose); standing down" in line for line in lines),
+                        f"the next tick stands down instead of relaunching: {lines} / {tick.stderr}")
+        self.assertEqual(self.rig.state_file("last_heal"), "", "the watchdog healed nothing")
+
+
+class TestStopReachesTheWorker(ShellCase):
+    def test_a_stop_reaches_the_worker_whose_state_dir_is_unreadable(self) -> None:
+        """The worker's config naming no readable STATE_DIR means the head cannot find the worker's supervisor pid.
+        That is a config problem on a reachable node, not an unreachable node: inferring unreachability from it
+        leaves rank 1's container up after a stop the operator ran on the pair."""
+        self.rig.write_config("zig")
+        (self.rig.root / "config" / "prod-zig.env").write_text(
+            "".join(f"{line}\n" for line in (self.rig.root / "config" / "prod-zig.env").read_text().splitlines()
+                    if not line.startswith("STATE_DIR=")))
+        r0, r1 = self.rig.zig_names()
+        self.rig.container(r0); self.rig.container(r1)
+
+        stop = self.rig.run(self.rig.serve, "stop")
+
+        self.assertEqual(stop.returncode, 0, f"{stop.stdout}{stop.stderr}")
+        self.assertNotIn("unreachable", stop.stdout, f"the worker answered ssh: {stop.stdout}")
+        self.assertNotIn(r1, self.rig.get_world()["containers"],
+                         f"the force stop reached rank 1's container: {stop.stdout}")
+
+
+class TestZigRecipeVerbs(ShellCase):
+    def test_the_args_verb_prints_the_zig_launchers_arguments(self) -> None:
+        """`serve.sh args 1` is the operator's look at what a rank would be launched with. On the Zig recipe that is
+        scripts/run-zig.sh's own print, not the Python recipe's container builder."""
+        self.rig.write_config("zig")
+
+        proc = self.rig.run(self.rig.serve, "args", "1")
+
+        self.assertEqual(proc.returncode, 0, f"the verb answers on the Zig recipe ({proc.stdout}{proc.stderr})")
+        self.assertIn("TF_TP_RANK=1", proc.stdout, f"{proc.stdout}")
+        self.assertIn("tf-dsv41-m1", proc.stdout, f"rank 1's own command: {proc.stdout}")
+
+    def test_prebuild_refuses_the_zig_recipe_and_names_the_check_it_replaces(self) -> None:
+        """The CUDA-extension prebuild is a Python-recipe build. A Zig profile that ran it would report built
+        extensions it never built; the Zig check is the launcher's --check-aot."""
+        self.rig.write_config("zig")
+
+        proc = self.rig.run(self.rig.serve, "prebuild")
+
+        self.assertEqual(proc.returncode, 2, f"prebuild is not this recipe's verb ({proc.stdout}{proc.stderr})")
+        self.assertIn("--check-aot", proc.stdout, f"name the check the Zig recipe has: {proc.stdout}")
+
+    def test_cache_fills_the_cache_the_zig_launcher_mounts(self) -> None:
+        """The Zig recipe mounts a per-node directory at /cache (scripts/run-zig.sh -v $CACHE_DIR:/cache), not the
+        Python recipe's docker volume. A cache verb pointed at the volume the profile never names fills nothing."""
+        self.rig.write_config("zig", TF_DSV41_PF_DENSE_TABLE="/cache/tables/pfdense.json")
+
+        proc = self.rig.run(self.rig.serve, "cache")
+        calls = self.rig.run_calls()
+
+        self.assertEqual(proc.returncode, 0, f"{proc.stdout}{proc.stderr}")
+        self.assertEqual(len(calls), 2, f"the table goes to both nodes: {calls}")
+        for n, call in zip(("head", "worker"), calls):
+            self.assertIn(f"-v {self.rig.root / 'cache'}:/cache", call,
+                          f"{n}: the mount names the CACHE_DIR the config of that node names, not the python "
+                          f"recipe's volume: {call}")
+            self.assertNotIn("-v :/cache", call, f"{n}: an unset CACHE_VOL is not a mount: {call}")
 
 
 if __name__ == "__main__":

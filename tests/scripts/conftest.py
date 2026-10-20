@@ -22,6 +22,7 @@ SHIM_DIR = Path(__file__).parent / "shims"
 SERVE_SH = ROOT / "scripts" / "serve.sh"
 RUN_ZIG_SH = ROOT / "scripts" / "run-zig.sh"
 EXAMPLE_ZIG = ROOT / "config" / "prod-zig.env.example"
+EXAMPLE_FLASH17 = ROOT / "config" / "prod-zig-flash17.env.example"
 
 IMAGE_PY = "test-image:1"
 IMAGE_ZIG = "test-zig-image:1"
@@ -118,8 +119,14 @@ class Rig:
         self.run_zig = RUN_ZIG_SH
         self.boot_start = ROOT / "scripts" / "boot-start.sh"
         self.boot = boot_id()
+        # The pair's two nodes reboot independently, so the worker has a boot id of its own, and its own state dir:
+        # rank 1's exit record, durable log and supervisor pid land there (config/prod-zig.env on the worker names
+        # them, and the head reads them over ssh). One filesystem can answer two nodes, one boot id cannot.
+        self.worker_boot = f"{self.boot}-worker"
         self.state = root / "state"
         self.state.mkdir()
+        self.worker_state = root / "worker-state"
+        self.worker_state.mkdir()
         self.bin = root / "bin"
         self.bin.mkdir()
         for shim in sorted(SHIM_DIR.iterdir()):
@@ -141,6 +148,8 @@ class Rig:
                                    "layers": "sha256:ziglayera sha256:ziglayerb"}},
             "logs": {f"{ZIG_KEYS['NAME']}-r0": ZIG_SLOT_LINE},
             "die_events": {},
+            "run_calls": [],
+            "worker_boot_id": self.worker_boot,
             "http": {"/health": {"code": "200", "body": HEALTH_OK},
                      "/v1/models": {"code": "200", "body": '{"data":[{"id":"Test-Model"}]}'}},
             "docker_run_rc": 0, "docker_run_hold_s": 30, "docker_info_rc": 0, "worker_docker_info_rc": 0, "ssh_rc": 0,
@@ -203,13 +212,11 @@ class Rig:
         data["docker_run_hold_s"] = seconds
         self._write_world(data)
 
-    def die_event(self, name: str, code: str, age_s: float, dialect: str = "iso") -> None:
-        """The die event `docker events --filter event=die` answers for a container with no cooperating launcher.
-        dialect="iso" answers a timestamp string, dialect="epoch" the epoch seconds `{{.Time}}` prints."""
+    def die_event(self, name: str, code: str, age_s: float) -> None:
+        """The die event `docker events` answers for a container with no cooperating launcher, at `age_s` seconds
+        ago. `{{.Time}}` prints epoch seconds, so that is what the fixture stores."""
         data = self.get_world()
-        when = time.time() - age_s
-        data.setdefault("die_events", {})[name] = {"code": code,
-                                                  "time": str(int(when)) if dialect == "epoch" else iso(when)}
+        data.setdefault("die_events", {})[name] = {"code": code, "time": int(time.time() - age_s)}
         self._write_world(data)
 
     def completions(self, code: str, body: str) -> None:
@@ -234,8 +241,14 @@ class Rig:
         self.state_file("stopped", f"{boot} {int(epoch)}")
 
     def exit_record(self, rank: int, code: str, epoch: float, boot: str | None = None) -> None:
-        """The launcher's exit witness for a rank: '<code> <epoch> <boot_id>' (scripts/run-zig.sh writes it)."""
-        self.state_file(f"exit-r{rank}", f"{code} {int(epoch)} {boot or self.boot}")
+        """The launcher's exit witness for a rank: '<code> <epoch> <boot_id>' (scripts/run-zig.sh writes it), in the
+        state dir of the node the rank ran on, stamped with that node's boot id."""
+        node_state, node_boot = (self.worker_state, self.worker_boot) if rank == 1 else (self.state, self.boot)
+        (node_state / f"exit-r{rank}").write_text(f"{code} {int(epoch)} {boot or node_boot}\n")
+
+    def worker_state_file(self, name: str) -> str:
+        path = self.worker_state / name
+        return path.read_text().strip() if path.exists() else ""
 
     def lease(self) -> Path:
         path = self.state / "lease"
@@ -284,23 +297,29 @@ class Rig:
             keys[key] = str(value)
         self.config.write_text("".join(f"{key}={value}\n" for key, value in keys.items()))
         if recipe == "zig":
-            # The worker's own checkout and config, so a head-side launch can `cd $WORKER_REPO &&
-            # scripts/run-zig.sh 1 --detached` exactly as it does on the nodes. The fixture keeps one state dir for
-            # both nodes, which is where rank 1's exit record and durable log land.
             self.make_zig_dirs()
-            (self.root / "config").mkdir(exist_ok=True)
-            (self.root / "config" / "prod-zig.env").write_text(self.config.read_text())
-            if not (self.root / "scripts").exists():
-                (self.root / "scripts").symlink_to(ROOT / "scripts")
+            self.write_worker_config()
         return self.config
 
-    def write_example_config(self, **overrides) -> Path:
+    def write_worker_config(self) -> None:
+        """The worker's copy of the checkout and of config/prod-zig.env, so a head-side launch can
+        `cd $WORKER_REPO && scripts/run-zig.sh 1 --detached` exactly as it does on the nodes. The pair names each
+        node's paths in that node's own config, so the copy differs from the head's where the paths differ: the
+        state dir, which is where rank 1's exit record, durable log and supervisor pid land."""
+        text = "".join(f"{line}\n" for line in self.config.read_text().splitlines()
+                       if not line.startswith("STATE_DIR="))
+        (self.root / "config").mkdir(exist_ok=True)
+        (self.root / "config" / "prod-zig.env").write_text(text + f"STATE_DIR={self.worker_state}\n")
+        if not (self.root / "scripts").exists():
+            (self.root / "scripts").symlink_to(ROOT / "scripts")
+
+    def example_keys(self, example: Path = EXAMPLE_ZIG) -> dict:
         """config/prod-zig.env.example as shipped, every placeholder filled with a fixture path: what an operator
         gets from `cp config/prod-zig.env.example config/prod-zig.env`. Only the test knobs (fixture ports, no
         canary, no memory gate, short timeouts, the context the fixture's rope.bin covers) are added, so a script
         that reads a key the example does not name fails here, not on a node."""
         keys = {}
-        for raw in EXAMPLE_ZIG.read_text().splitlines():
+        for raw in example.read_text().splitlines():
             line = raw.strip().removeprefix("export ")
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -310,11 +329,15 @@ class Rig:
                 continue
             if value.startswith("<"):
                 if key not in self.EXAMPLE_FILL:
-                    raise AssertionError(f"config/prod-zig.env.example names a new placeholder for {key}: "
+                    raise AssertionError(f"{example.name} names a new placeholder for {key}: "
                                          f"name its fixture value in Rig.EXAMPLE_FILL")
                 rel = self.EXAMPLE_FILL[key]
                 value = rel[1:] if rel.startswith("=") else str(self.root if rel == "." else self.root / rel)
             keys[key] = value
+        return keys
+
+    def write_example_config(self, example: Path = EXAMPLE_ZIG, **overrides) -> Path:
+        keys = self.example_keys(example)
         keys.update({"PORT": "8199", "CANARY": "off", "DROP_CACHES": "0", "MEM_GATE_GIB": "0",
                      "READY_TIMEOUT": "15", "TF_DSV41_CONTEXT": "1024", "TF_DSV41_SLOTS": "4",
                      "ROCE_STATE": str(self.root / "roce"), "WATCH_HEAL": "1",
@@ -323,10 +346,7 @@ class Rig:
         self.config.write_text("".join(f"{key}={value}\n" for key, value in keys.items()))
         self.make_zig_dirs()
         self.make_pair_files()
-        (self.root / "config").mkdir(exist_ok=True)
-        (self.root / "config" / "prod-zig.env").write_text(self.config.read_text())
-        if not (self.root / "scripts").exists():
-            (self.root / "scripts").symlink_to(ROOT / "scripts")
+        self.write_worker_config()
         return self.config
 
     def make_pair_files(self) -> None:
@@ -363,6 +383,21 @@ class Rig:
         env.update({key: str(value) for key, value in (env_extra or {}).items()})
         return subprocess.run(["bash", str(script), *args], cwd=str(ROOT), env=env,
                               capture_output=True, text=True, timeout=timeout)
+
+    def run_as_worker(self, script: Path, *args: str, env_extra: dict | None = None,
+                      timeout: float = 90.0) -> subprocess.CompletedProcess:
+        """Run a script the way the worker runs it: in the worker's checkout, as the worker node role, on the config
+        the worker's launcher reads (the copy at config/prod-zig.env, which names the worker's state dir)."""
+        env = self.env()
+        env["NODE_ROLE"] = "worker"
+        env["CONFIG"] = str(self.root / "config" / "prod-zig.env")
+        env.update({key: str(value) for key, value in (env_extra or {}).items()})
+        return subprocess.run(["bash", str(script), *args], cwd=str(self.root), env=env,
+                              capture_output=True, text=True, timeout=timeout)
+
+    def run_calls(self) -> list[str]:
+        """The `docker run` argument strings the shim has been asked to run, in order."""
+        return self.get_world().get("run_calls", [])
 
     def make_roce_active(self) -> None:
         """The sysfs tree nodes_ready reads: every NCCL_IB_HCA device the config names, port 1 ACTIVE, under

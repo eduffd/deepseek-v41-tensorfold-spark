@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
-# setsid(1) stand-in (macOS ships none): the detached heal only needs the command to run, not a new session.
-exec "$@"
+# setsid(1) stand-in (macOS ships none): a new session, so a detached loop is a process-group leader and a stop can
+# end it with `kill -- -pid`, exactly as it does on the nodes.
+exec python3 -I -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
