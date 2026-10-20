@@ -70,6 +70,13 @@ log() { echo "[dsv41-tf] $*"; }
 wssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$@"; }
 on_node() { local n=$1; shift; if [[ "$n" == head ]]; then bash -c "$*"; else wssh "$*"; fi; }
 
+worker_config_key() { # $1 = key: its value in the worker's own copy of the config its launcher reads
+    # (config/prod-zig.env in $WORKER_REPO). The head cannot see that file, and the pair's paths differ per node
+    # (engram-r0 here, engram-r1 there), so the worker's paths can only be read from the worker.
+    [[ -n "${WORKER_REPO:-}" ]] || return 0
+    wssh "cd '$WORKER_REPO' && sed -n 's/^$1=//p' config/prod-zig.env | tail -1" 2>/dev/null | tr -d '"' || true
+}
+
 roce_cmd() { # the RoCE leg as one command string, so the head and the worker run the same test (printf keeps $d for
     # the node's own shell): every NCCL_IB_HCA device's port 1 must read ACTIVE
     printf 'for d in %s; do grep -q ACTIVE %s/$d/ports/1/state || exit 1; done' "${NCCL_IB_HCA//,/ }" "$ROCE_STATE"
@@ -155,8 +162,20 @@ image_key() { docker image inspect -f "$IMAGE_KEY_FMT" "$1" 2>/dev/null | sha256
 wimage_key() { wssh "docker image inspect -f '$IMAGE_KEY_FMT' '$1' 2>/dev/null | sha256sum | cut -c1-16"; }
 
 preflight() { # read-only checks of both nodes; non-zero on a problem. $1 = static: skip ports / GPU / RoCE marker
-    local bad=0 node f h w
+    local bad=0 node f h w wm we wp ws
     nodes_ready || { log "preflight: the readiness gate failed (docker, ssh, RoCE)"; return 1; }
+    if [[ "$RECIPE" == zig ]]; then
+        # The Zig profile names each node's paths once, in that node's own config (MODEL_DIR / ENGRAM_DIR /
+        # PREPARED_DIR / STATE_DIR), and preflight speaks the head/worker names the Python config names. The head's
+        # come from the config loaded here; the worker's from the config the worker's launcher reads. A start (and
+        # every heal) runs this, so the read happens on the start path, never on a tick.
+        HEAD_MODEL="${HEAD_MODEL:-$MODEL_DIR}"; HEAD_ENGRAM="${HEAD_ENGRAM:-$ENGRAM_DIR}"
+        HEAD_PREPARED="${HEAD_PREPARED:-$PREPARED_DIR}"; HEAD_STATE="${HEAD_STATE:-$STATE_DIR}"
+        wm=$(worker_config_key MODEL_DIR); we=$(worker_config_key ENGRAM_DIR)
+        wp=$(worker_config_key PREPARED_DIR); ws=$(worker_config_key STATE_DIR)
+        WORKER_MODEL="${WORKER_MODEL:-${wm:-$HEAD_MODEL}}"; WORKER_ENGRAM="${WORKER_ENGRAM:-${we:-$HEAD_ENGRAM}}"
+        WORKER_PREPARED="${WORKER_PREPARED:-${wp:-$HEAD_PREPARED}}"; WORKER_STATE="${WORKER_STATE:-${ws:-$HEAD_STATE}}"
+    fi
     h=$(docker image inspect -f '{{.Id}}' "$IMAGE" >/dev/null 2>&1 && image_key "$IMAGE" || true)
     w=$(wssh docker image inspect "$IMAGE" >/dev/null 2>&1 && wimage_key "$IMAGE" || true)
     [[ -n "$h" ]] || { log "preflight: no image $IMAGE here (scripts/serve.sh build)"; bad=1; }
@@ -185,6 +204,17 @@ preflight() { # read-only checks of both nodes; non-zero on a problem. $1 = stat
 }
 
 boot_id() { echo "${WATCH_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)}"; }
+epoch_of() { # a docker timestamp as an epoch: docker events' .Time answers epoch seconds, docker inspect's
+    # FinishedAt a UTC string, and a numeric field is normalized when it is millis- or nanos-long. 0 when it answers
+    # neither: an epoch of 0 reads as an earlier boot, the safe direction for a witness the actor cannot place in time.
+    local t=${1:-}
+    [[ "$t" =~ ^[0-9]+$ ]] || { date -d "${t%%.*}" +%s 2>/dev/null || echo 0; return 0; }
+    case "${#t}" in
+        13) echo $(( t / 1000 )) ;;
+        19) echo $(( t / 1000000000 )) ;;
+        *) echo "$t" ;;
+    esac
+}
 boot_start_epoch() { # when this boot began: an exit record's epoch is compared with it to tell this boot's deaths
     awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0
 }
@@ -246,7 +276,7 @@ cmd_start() {
         log "short of request slots: dropping the caches and starting again"
     done
     case $rc in
-        0) log "serving on :$PORT ($SERVED_NAME, image $IMAGE)" ;;
+        0) log "serving on :$PORT (${SERVED_NAME:-${HEAD_MODEL:-$MODEL_DIR}}, image $IMAGE)" ;;
         2) log "canary failed: stopping both ranks (logs in $STATE_DIR)"; mkdir -p "$STATE_DIR"
            docker logs --tail 200 "$NAME-r0" > "$STATE_DIR/canary-fail-r0.log" 2>&1 || true
            wssh docker logs --tail 200 "$NAME-r1" > "$STATE_DIR/canary-fail-r1.log" 2>&1 || true
@@ -272,13 +302,100 @@ cmd_start() {
 # than both witnesses); a marker from an earlier boot is bad (a `stop` before a reboot does not survive it;
 # boot-start.sh starts first); both ranks absent with no witness and no marker means the pair never started on this
 # node. No threshold in the actor is a stall threshold: the 503 labels and the 70 are the engine's, re-derived here.
+# A 200 /health whose body says inflight 0 and queued 0 is asked one tiny greedy completion (WATCH_PROBE=1): the
+# idle-wedge family reports nothing, so only a request the engine must answer reaches it. A heal stops the pair before
+# it can read anything, so capture_evidence writes the pair's own words to $STATE_DIR/heal-<utc>/ first. Heals count
+# (STATE_DIR/heals): WATCH_MAX_HEALS in a row with no clean tick alerts and stops healing, which is the pair needing a
+# human look, not a pair needing a sixth restart.
 WATCH_GRACE="${WATCH_GRACE:-1800}"; WATCH_FAILS="${WATCH_FAILS:-3}"; WATCH_HEAL="${WATCH_HEAL:-0}"
 WATCH_MIN_HEAL="${WATCH_MIN_HEAL:-1800}"; WATCH_FF_MIN_HEAL="${WATCH_FF_MIN_HEAL:-120}"; WATCH_ALERT="${WATCH_ALERT:-}"
 WATCH_LEASE="${WATCH_LEASE:-}"; WATCH_LEASE_MIN="${WATCH_LEASE_MIN:-20}"
+WATCH_HEAL_GRACE="${WATCH_HEAL_GRACE:-15}"; WATCH_MAX_HEALS="${WATCH_MAX_HEALS:-5}"
+WATCH_EVIDENCE_KEEP="${WATCH_EVIDENCE_KEEP:-20}"
+WATCH_PROBE="${WATCH_PROBE:-0}"; WATCH_PROBE_S="${WATCH_PROBE_S:-120}"; WATCH_PROBE_EVERY_S="${WATCH_PROBE_EVERY_S:-120}"
 lease_fresh() { [[ -n "$WATCH_LEASE" && -f "$WATCH_LEASE" ]] && (( $(date +%s) - $(stat -c %Y "$WATCH_LEASE") < WATCH_LEASE_MIN * 60 )); }
 alert() { log "ALERT: $*"; [[ -z "$WATCH_ALERT" ]] || "$WATCH_ALERT" "$*" || true; }
 STALLED_RE='"status"[[:space:]]*:[[:space:]]*"stalled"'
 FATAL_RE='"ok"[[:space:]]*:[[:space:]]*false'
+IDLE_RE='"inflight"[[:space:]]*:[[:space:]]*0[,}]'
+QUEUED_RE='"queued"[[:space:]]*:[[:space:]]*0[,}]'
+
+pair_probe() { # one greedy completion, asked for only when an idle pair has just reported itself healthy: rank 1 wedged
+    # with rank 0 idle leaves /health 200 and no round to age (engine-side gap #3, docs/KNOWN-ISSUES.md), so the actor
+    # asks for the one thing a wedged engine cannot produce. No threshold of its own: the answer is a 200 with a
+    # choice, and WATCH_PROBE_EVERY_S is the throttle, not a stall knob.
+    local model now payload
+    now=$(date +%s)
+    [[ -f "$STATE_DIR/last_probe" ]] && (( now - $(cat "$STATE_DIR/last_probe") < WATCH_PROBE_EVERY_S )) && return 0
+    echo "$now" > "$STATE_DIR/last_probe"
+    model=$(curl -s -m 10 "$BASE/v1/models" | python3 -c 'import json,sys;print(json.load(sys.stdin)["data"][0]["id"])' 2>/dev/null || true)
+    [[ -n "$model" ]] || { bad="probe no model id from /v1/models"; cls=debounced; return 0; }
+    payload='{"model":"'"$model"'","messages":[{"role":"user","content":"Reply with the number 42."}],"max_tokens":8,"temperature":0,"reasoning_effort":"low"}'
+    if ! curl -s -m "$WATCH_PROBE_S" -H 'Content-Type: application/json' -d "$payload" \
+        "$BASE/v1/chat/completions" 2>&1 | grep -q '"choices"'; then
+        bad="probe no completion within ${WATCH_PROBE_S}s (model $model, inflight 0, queued 0)"
+        cls=debounced
+    fi
+    return 0
+}
+
+cmd_heal() { # everything the operator reads after a heal, and the state the next tick will act on: read-only.
+    local now last f tailn
+    now=$(date +%s); tailn="${TAIL:-40}"
+    last=$(cat "$STATE_DIR/last_heal" 2>/dev/null || echo 0)
+    if [[ "$last" == 0 ]]; then log "last heal: none (age 0s)"
+    else log "last heal: $last (age $(( now - last ))s)"
+    fi
+    log "fails: $(cat "$STATE_DIR/fails" 2>/dev/null || echo 0) of WATCH_FAILS=$WATCH_FAILS; heals in a row: $(cat "$STATE_DIR/heals" 2>/dev/null || echo 0) of WATCH_MAX_HEALS=$WATCH_MAX_HEALS"
+    if lease_fresh; then
+        log "lease: $WATCH_LEASE is fresh; the tick stands down"
+    elif [[ -n "$WATCH_LEASE" && -f "$WATCH_LEASE" ]]; then
+        log "lease: $WATCH_LEASE, age $(( now - $(stat -c %Y "$WATCH_LEASE") ))s"
+    else
+        log "lease: ${WATCH_LEASE:-unset}"
+    fi
+    if flock -n "$STATE_DIR/lock" true; then log "lock: free"; else log "lock: held (a start or a heal runs now)"; fi
+    log "witness r0: $(pair_exit 0)"
+    log "witness r1: $(pair_exit 1)"
+    log "stop marker: $(cat "$STATE_DIR/stopped" 2>/dev/null || echo none)"
+    log "heal.log, last $tailn lines:"
+    tail -n "$tailn" "$STATE_DIR/heal.log" 2>/dev/null || true
+    log "rank 0 log tail:"
+    docker logs --tail "$tailn" "$NAME-r0" 2>&1 | tail -n "$tailn" || true
+    log "rank 1 log tail:"
+    wssh docker logs --tail "$tailn" "$NAME-r1" 2>&1 | tail -n "$tailn" || true
+    for f in "$STATE_DIR/run-zig-r0.log" "$STATE_DIR/run-zig-r1.log"; do
+        [[ -f "$f" ]] || continue
+        log "launcher log $f, last 20 lines:"
+        tail -n 20 "$f"
+    done
+}
+
+capture_evidence() { # the heal's stop is a force stop and the Zig pair's containers carry --rm, so this is the last
+    # moment the wedged pair's own words exist. One folder per heal, newest WATCH_EVIDENCE_KEEP kept. The tick hands
+    # the verdict down in its environment; nothing here re-derives it.
+    local dir keep old body code
+    dir="$STATE_DIR/heal-$(date -u +%Y%m%d-%H%M%S)"
+    mkdir -p "$dir" || return 0
+    { echo "class=${DSV41_TF_CLASS:-unknown}"
+      echo "note=${DSV41_TF_NOTE:-none}"
+      echo "witness_r0=${DSV41_TF_W0:-none}"
+      echo "witness_r1=${DSV41_TF_W1:-none}"
+      echo "stop_marker=$(cat "$STATE_DIR/stopped" 2>/dev/null || echo none)"
+      echo "heals=$(cat "$STATE_DIR/heals" 2>/dev/null || echo 0)"
+      echo "boot=$(boot_id)"; } > "$dir/verdict.txt" 2>&1
+    body=$(curl -s -m 10 -w '\n%{http_code}' "$BASE/health" 2>/dev/null || true)
+    code=${body##*$'\n'}; body=${body%$'\n'*}
+    echo "health_http=$code" >> "$dir/verdict.txt"
+    printf '%s' "$body" > "$dir/health.json"
+    docker logs --tail 200 "$NAME-r0" > "$dir/r0.log" 2>&1 || true
+    wssh docker logs --tail 200 "$NAME-r1" > "$dir/r1.log" 2>&1 || true
+    { nvidia-smi; echo '--- worker ---'; wssh nvidia-smi; } > "$dir/gpu.txt" 2>&1 || true
+    [[ -f "$STATE_DIR/run-zig-r0.log" ]] && tail -200 "$STATE_DIR/run-zig-r0.log" > "$dir/r0-launcher.log" || true
+    keep=${WATCH_EVIDENCE_KEEP:-20}
+    while IFS= read -r d; do rm -rf "$d"; done < <(ls -1dt "$STATE_DIR"/heal-*/ 2>/dev/null | tail -n +$((keep + 1)))
+    log "heal: evidence in $dir"
+}
 
 witness_class() { # $1 code $2 epoch $3 boot: exit 70 on this boot, newer than the last heal, is the engine reporting
     # a dead-and-consistent pair; every other code is the actor reading what a container left behind.
@@ -315,7 +432,10 @@ classify() { # one merge site, reading watch_tick's locals: sets bad (the verdic
     age=$(( now - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$NAME-r0")" +%s) ))
     body=$(curl -s -m 10 -w '\n%{http_code}' "$BASE/health" || true)
     code=${body##*$'\n'}; body=${body%$'\n'*}
-    if [[ "$code" == 200 ]]; then return 0; fi
+    if [[ "$code" == 200 ]]; then
+        [[ "$WATCH_PROBE" == 1 && "$body" =~ $IDLE_RE && "$body" =~ $QUEUED_RE ]] && pair_probe
+        return 0
+    fi
     if [[ "$code" == 000 && $age -lt $WATCH_GRACE ]]; then cls=standdown; stand="loading (${age}s)"; return 0; fi
     bad="/health $code ${body:0:300}"
     cls=debounced
@@ -326,9 +446,10 @@ classify() { # one merge site, reading watch_tick's locals: sets bad (the verdic
 
 watch_tick() {
     mkdir -p "$STATE_DIR"
-    local fails_f="$STATE_DIR/fails" heal_f="$STATE_DIR/last_heal" fails r0 r1 age code body now last bad cls stand
+    local fails_f="$STATE_DIR/fails" heal_f="$STATE_DIR/last_heal" heals_f="$STATE_DIR/heals" fails heals r0 r1 age code body now last bad cls stand
     local e0 e1 c0 t0 b0 c1 t1 b1 mb mt cb need min
     fails=$(cat "$fails_f" 2>/dev/null || echo 0); now=$(date +%s); last=$(cat "$heal_f" 2>/dev/null || echo 0)
+    heals=$(cat "$heals_f" 2>/dev/null || echo 0)
     if lease_fresh; then echo 0 > "$fails_f"; log "watch: $WATCH_LEASE is fresh; standing down"; return 0; fi
     if ! flock -n "$STATE_DIR/lock" true; then log "watch: a start is in progress; standing down"; return 0; fi
     r0=$(running 0); r1=$(running 1)
@@ -340,7 +461,7 @@ watch_tick() {
     cb=$(boot_id)
     classify
     if [[ "$cls" == standdown ]]; then echo 0 > "$fails_f"; log "watch: $stand"; return 0; fi
-    if [[ -z "$bad" ]]; then echo 0 > "$fails_f"; return 0; fi
+    if [[ -z "$bad" ]]; then echo 0 > "$fails_f"; echo 0 > "$heals_f"; return 0; fi
     need=$WATCH_FAILS; min=$WATCH_MIN_HEAL
     [[ "$cls" == definitive ]] && { need=1; min=$WATCH_FF_MIN_HEAL; }
     fails=$((fails + 1)); echo "$fails" > "$fails_f"
@@ -348,9 +469,16 @@ watch_tick() {
     (( fails >= need )) || return 0
     if [[ "$WATCH_HEAL" != 1 ]]; then alert "unhealthy ($bad); WATCH_HEAL=0, not restarting"; return 1; fi
     if (( now - last < min )); then alert "unhealthy ($bad); healed $((now - last))s ago, waiting"; return 1; fi
-    echo "$now" > "$heal_f"; echo 0 > "$fails_f"
+    if (( WATCH_MAX_HEALS > 0 && heals >= WATCH_MAX_HEALS )); then
+        alert "unhealthy ($bad); $heals heals in a row with no clean tick between them, not restarting (WATCH_MAX_HEALS=$WATCH_MAX_HEALS): read $STATE_DIR/heal.log and the heal folders"
+        return 1
+    fi
+    echo "$now" > "$heal_f"; echo 0 > "$fails_f"; echo $((heals + 1)) > "$heals_f"
     alert "unhealthy ($bad); restarting both ranks"
-    setsid env DSV41_TF_LOCKED=1 flock "$STATE_DIR/lock" "$0" restart >>"$STATE_DIR/heal.log" 2>&1 < /dev/null &
+    # The verdict travels with the heal, which writes it into its evidence folder before it stops the pair.
+    setsid env DSV41_TF_LOCKED=1 DSV41_TF_HEAL=1 DSV41_TF_GRACE="$WATCH_HEAL_GRACE" CANARY=off \
+        DSV41_TF_CLASS="$cls" DSV41_TF_NOTE="$bad" DSV41_TF_W0="$e0" DSV41_TF_W1="$e1" \
+        flock "$STATE_DIR/lock" "$0" restart >>"$STATE_DIR/heal.log" 2>&1 < /dev/null &
     return 1
 }
 
@@ -435,8 +563,11 @@ cache) cache_files ;;
 run) [[ "$RECIPE" == python ]] || { log "run: the engine-module runner belongs to the python recipe"; exit 2; }
      shift; cmd_run "$@" ;;
 start) cmd_start ;;
-restart) take_lock; pair_stop 0; log "stopped"; cmd_start ;;
+# The heal's restart drains with WATCH_HEAL_GRACE (0 for a human restart, which has never had a drain step) and writes
+# its evidence before the force stop, when the wedged pair's own words are last readable.
+restart) take_lock; [[ "${DSV41_TF_HEAL:-0}" == 1 ]] && capture_evidence; pair_stop "${DSV41_TF_GRACE:-0}"; log "stopped"; cmd_start ;;
 stop) pair_stop 0; mark_stopped; log "stopped (stop marker: $STATE_DIR/stopped)" ;;
+heal) cmd_heal ;;
 status)
     docker ps -a --filter "name=^$NAME-r" --format '{{.Names}} {{.Status}}'
     wssh "docker ps -a --filter name=^$NAME-r --format '{{.Names}} {{.Status}}'" || true
