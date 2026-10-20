@@ -10,6 +10,7 @@ the harness's job, never the scripts'. tests/scripts/shims/_world.py is the fixt
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
@@ -149,20 +150,36 @@ class Rig:
             "logs": {f"{ZIG_KEYS['NAME']}-r0": ZIG_SLOT_LINE},
             "die_events": {},
             "run_calls": [],
+            "events_calls": [],
             "worker_boot_id": self.worker_boot,
             "http": {"/health": {"code": "200", "body": HEALTH_OK},
                      "/v1/models": {"code": "200", "body": '{"data":[{"id":"Test-Model"}]}'}},
             "docker_run_rc": 0, "docker_run_hold_s": 30, "docker_info_rc": 0, "worker_docker_info_rc": 0, "ssh_rc": 0,
         }))
         data.update(patch)
-        self.world_path.write_text(json.dumps(data))
+        self._write_world(data)
         return data
 
+    def _world_lock(self, mode: int):
+        """world.json.lock, the same lock the shims take: a shim's write truncates the file, so a reader that lands in
+        the middle of one reads an empty world. Tests read and write the world the shims are writing."""
+        lk = open(str(self.world_path) + ".lock", "a+")
+        fcntl.flock(lk, mode)
+        return lk
+
     def get_world(self) -> dict:
-        return json.loads(self.world_path.read_text())
+        lk = self._world_lock(fcntl.LOCK_SH)
+        try:
+            return json.loads(self.world_path.read_text())
+        finally:
+            lk.close()
 
     def _write_world(self, data: dict) -> None:
-        self.world_path.write_text(json.dumps(data))
+        lk = self._world_lock(fcntl.LOCK_EX)
+        try:
+            self.world_path.write_text(json.dumps(data))
+        finally:
+            lk.close()
 
     def container(self, name: str, *, running="true", exit_code="0", status="running",
                   age_s: float = 300.0, finished_age_s: float | None = None) -> str:
@@ -204,6 +221,13 @@ class Rig:
     def run_rc(self, rc: int) -> None:
         data = self.get_world()
         data["docker_run_rc"] = rc
+        self._write_world(data)
+
+    def worker_rm_rc(self, rc: int) -> None:
+        """The worker's docker answers a `docker rm -f` with this return code. Its own key, because a node's daemon
+        fails on its own: a stop whose worker refuses the removal leaves rank 1 running."""
+        data = self.get_world()
+        data["worker_docker_rm_rc"] = rc
         self._write_world(data)
 
     def run_hold_s(self, seconds: float) -> None:
@@ -385,6 +409,11 @@ class Rig:
         return subprocess.run(["bash", str(script), *args], cwd=str(ROOT), env=env,
                               capture_output=True, text=True, timeout=timeout)
 
+    def sh(self, line: str, timeout: float = 60.0) -> subprocess.CompletedProcess:
+        """A shell line run with the fixture's PATH shims and FIXTURE, which is how the scripts run it."""
+        return subprocess.run(["bash", "-c", line], cwd=str(ROOT), env=self.env(),
+                              capture_output=True, text=True, timeout=timeout)
+
     def run_as_worker(self, script: Path, *args: str, env_extra: dict | None = None,
                       timeout: float = 90.0) -> subprocess.CompletedProcess:
         """Run a script the way the worker runs it: in the worker's checkout, as the worker node role, on the config
@@ -399,6 +428,11 @@ class Rig:
     def run_calls(self) -> list[str]:
         """The `docker run` argument strings the shim has been asked to run, in order."""
         return self.get_world().get("run_calls", [])
+
+    def events_calls(self) -> list[str]:
+        """The `docker events` argument strings the shim has been asked to run, in order: the window a witness read
+        used is part of what the scripts emit, not a detail of the read."""
+        return self.get_world().get("events_calls", [])
 
     def make_roce_active(self) -> None:
         """The sysfs tree nodes_ready reads: every NCCL_IB_HCA device the config names, port 1 ACTIVE, under

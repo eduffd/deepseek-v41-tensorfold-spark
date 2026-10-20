@@ -447,6 +447,40 @@ class TestDieEventWitness(ShellCase):
         self.assertIn("serving on :8199", self.run_to_ready(self.rig),
                       f"the first tick launches the heal: {lines}")
 
+    def test_the_die_event_window_is_emitted_in_the_form_the_daemon_parses(self) -> None:
+        """The window's shape is part of the witness: docker/cli forwards --since and --until to the daemon untouched,
+        and the daemon parses each with strconv.ParseInt of seconds, so `180s` and `0s` are parse errors, the query
+        answers nothing, and a rank with no cooperating launcher reads as having no witness at all. The shim answers
+        the window the way the daemon does, so a window built from intervals is red here and dead on a node, not two
+        different facts."""
+        r0, r1 = self.rig.zig_names()
+        self.rig.container(r0)
+        self.rig.absent(r1)
+        self.rig.die_event(r1, "70", 60)
+
+        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+        self.assertTrue(any("rank 1 absent (fail-fast exit 70)" in line for line in lines),
+                        f"the read answered: {lines} / {proc.stderr}")
+
+        calls = self.rig.events_calls()
+        self.assertTrue(calls, f"the tick read the die event: {lines}")
+        for call in calls:
+            for flag in ("--since", "--until"):
+                if flag not in call:
+                    continue
+                value = call.split(flag)[1].split()[0]
+                self.assertTrue(value.isdigit(), f"{flag} {value}: the daemon parses epoch seconds only: {call}")
+
+        interval = self.rig.sh(
+            f"docker events --filter event=die --filter container={r1} "
+            f"--format '{{{{.Time}}}} {{{{.Actor.Attributes.exitCode}}}}' --since 180s --until 0s")
+        self.assertEqual(interval.stdout, "",
+                         f"an interval window yields no events, the way the daemon's 400 does: {interval.stdout}")
+        self.assertEqual(interval.returncode, 1,
+                         f"and the CLI prints the daemon's parse error: {interval.stderr}")
+        self.assertIn("strconv.ParseInt", interval.stderr, f"{interval.stderr}")
+
 
 class TestSupervisedRank(ShellCase):
     def test_a_human_stop_ends_the_supervised_relaunch_loop(self) -> None:
@@ -529,6 +563,25 @@ class TestDieEventWindow(ShellCase):
 
         self.assertEqual(lines, ["[dsv41-tf] watch: both ranks absent (stopped on purpose); standing down"],
                          f"an event from before the stop is a death the stop already answered: {lines} / {proc.stderr}")
+
+    def test_a_marker_from_an_earlier_boot_is_no_anchor(self) -> None:
+        """The marker the nodes carry is a file, so it outlives the boot that wrote it. Anchoring the window on it
+        stretches the window across the reboot, and a die event carries no boot id, so the read would stamp a
+        pre-reboot death as this boot and the tick would treat it as definitive."""
+        r0, r1 = self.rig.zig_names()
+        self.rig.absent(r0, r1)
+        self.rig.marker("boot-before-the-reboot", time.time() - 300)
+        self.rig.die_event(r0, "137", 240)
+
+        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertEqual(len(lines), 1, f"one row, the reboot row, not a witness row: {lines} / {proc.stderr}")
+        self.assertTrue(lines[0].startswith("[dsv41-tf] watch: bad tick 1 of 3: both ranks absent after a reboot "
+                                            "(stopped before it: "),
+                        f"a stop from before the reboot anchors nothing on this boot: {lines} / {proc.stderr}")
+        self.assertNotIn("137", lines[0], f"the pre-reboot death is no witness: {lines[0]}")
+        self.assertNotIn("fail-fast", lines[0], f"and the tick is debounced, not definitive: {lines[0]}")
 
 
 class TestHealYieldsToAStart(ShellCase):
@@ -632,6 +685,46 @@ class TestStopReachesTheWorker(ShellCase):
         self.assertNotIn("unreachable", stop.stdout, f"the worker answered ssh: {stop.stdout}")
         self.assertNotIn(r1, self.rig.get_world()["containers"],
                          f"the force stop reached rank 1's container: {stop.stdout}")
+
+    def test_a_tick_names_a_worker_state_dir_the_worker_config_does_not_name(self) -> None:
+        """Rank 1's exit record lives in the state dir named by the worker's own config. A worker config that names
+        none answers an empty path, which reads as a rank with no witness: that is a config fault, and read as a
+        plain absence it is the pair's own problem with no line saying the reader is blind."""
+        self.rig.write_config("zig", WATCH_HEAL="1")
+        (self.rig.root / "config" / "prod-zig.env").write_text(
+            "".join(f"{line}\n" for line in (self.rig.root / "config" / "prod-zig.env").read_text().splitlines()
+                    if not line.startswith("STATE_DIR=")))
+        r0, r1 = self.rig.zig_names()
+        self.rig.container(r0)
+        self.rig.absent(r1)
+
+        proc = self.rig.run(self.rig.serve, "watch", "--once")
+        lines = self.rig.stdout_lines(proc)
+
+        self.assertIn("the worker's own config names no STATE_DIR", proc.stderr,
+                      f"the blind read is said, on stderr, so it cannot be captured into the witness the tick is "
+                      f"reading: {lines} / {proc.stderr}")
+        self.assertTrue(any("bad tick 1 of 3" in line for line in lines),
+                        f"a rank with no witness is the actor's own observation, so it is debounced: {lines}")
+
+    def test_a_stop_names_a_rank_1_the_worker_refused_to_remove(self) -> None:
+        """Each node's daemon answers its own removal. A worker whose docker refuses `docker rm -f` leaves rank 1
+        running, and the stop marker written right after makes the watchdog stand down beside that container: the row
+        naming it is the only record that the pair is not what the marker says it is."""
+        self.rig.write_config("zig")
+        r0, r1 = self.rig.zig_names()
+        self.rig.container(r0); self.rig.container(r1)
+        self.rig.worker_rm_rc(1)
+
+        stop = self.rig.run(self.rig.serve, "stop")
+        lines = self.rig.stdout_lines(stop)
+
+        self.assertTrue(any("rank 1" in line and "left running" in line for line in lines),
+                        f"a removal the worker refused is said, not swallowed: {stop.stdout}{stop.stderr}")
+        self.assertIn(r1, self.rig.get_world()["containers"],
+                      f"the container is really there, which is why the row is owed: {stop.stdout}")
+        self.assertNotIn(r0, self.rig.get_world()["containers"],
+                         f"the head's own removal still happened: {stop.stdout}")
 
 
 class TestZigRecipeVerbs(ShellCase):

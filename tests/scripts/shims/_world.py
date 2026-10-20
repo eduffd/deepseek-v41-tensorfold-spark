@@ -6,10 +6,10 @@ http bodies keyed by path, die events keyed by container name, and the return co
 A shim never invents state: what serve.sh sees is exactly what the fixture says. `docker run` with a --name adds that
 running container to the world and holds it for `docker_run_hold_s` seconds (0: return at once), which is how a launched
 rank becomes visible to `docker ps` / `docker inspect`; a non-zero docker_run_rc answers at once, the way a rank that
-dies immediately does. Writes take a lock: a launch runs rank 1 and rank 0 side by side.
+dies immediately does. Reads and writes take world.json.lock: a launch runs rank 1 and rank 0 side by side, and a tick
+reads the world a shim is writing.
 """
 
-import datetime
 import fcntl
 import json
 import os
@@ -19,15 +19,22 @@ import time
 
 
 def load(path):
-    with open(path) as f:
-        return json.load(f)
+    """Read of world.json. A mutate truncates the file before it dumps, so a reader that lands in between reads an
+    empty file, and the shim that read it answers a rank as absent, a stop as reaching nothing. Reads take the same
+    lock's shared side; a tick, a probe and a stop read the world side by side."""
+    with open(path + ".lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_SH)
+        with open(path) as f:
+            return json.load(f)
 
 
 def mutate(path, change):
-    """Read-modify-write on world.json, serialized: two ranks launch at the same moment."""
+    """Read-modify-write on world.json, serialized: two ranks launch at the same moment. The read is taken here,
+    inside the lock, so no writer ever reads a half-dumped file."""
     with open(path + ".lock", "a+") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        data = load(path)
+        with open(path) as f:
+            data = json.load(f)
         result = change(data)
         with open(path, "w") as f:
             json.dump(data, f)
@@ -82,13 +89,19 @@ def render(fmt, event):
     return re.sub(r"\{\{(.*?)\}\}", lambda m: value(m.group(1)), fmt)
 
 
-def events_op(world, argv):
+def events_op(world, path, argv):
     """docker events --format <tmpl> --filter event=die --filter container=<name> [--since X] [--until X].
 
     The template is validated against the fields `events.Message` answers, and a template naming a field it does not
-    answer is exit 64 with no output, which is what the CLI's own check does. `--since` / `--until` bound the window
-    (a bare `<n>s` is relative to now, `0s` is now, an epoch or an RFC3339 stamp is absolute), because the pair's
-    witness chain anchors the die-event read to its own stop marker."""
+    answer is exit 64 with no output, which is what the CLI's own check does.
+
+    `--since` / `--until` bound the window the way the daemon bounds it, because the CLI forwards them untouched
+    (docker/cli cli/command/system/events.go): the daemon parses each with strconv.ParseInt of `seconds[.nanoseconds]`
+    (moby api/types/time/timestamp.go, v20.10.24 through v28.5.2, reached from the events route's eventTime), so an
+    epoch is the only form that answers. `180s` and `0s` are parse errors: the daemon answers 400, the CLI prints the
+    parse error, and the read yields no events. Accepting interval forms here is what let a window built from them pass
+    the suite while answering nothing on a node. Each read is recorded in the world, so a test can name the window the
+    scripts emitted."""
     fmt, fmtflag = argv[0], argv[1] == "1"
     args = argv[2:]
     if fmtflag:
@@ -118,18 +131,21 @@ def events_op(world, argv):
         i += 1
 
     def bound(value, default):
+        """The daemon's parse: seconds, an optional `.nanoseconds`, nothing else. None means the value does not parse."""
         if value is None:
             return default
-        if value.endswith("s") and value[:-1].isdigit():
-            return time.time() - int(value[:-1])
-        if value.isdigit():
-            return int(value)
-        try:
-            return int(datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
-        except ValueError:
-            return default
+        parts = value.split(".")
+        if not parts[0].isdigit() or (len(parts) > 1 and not parts[1].isdigit()):
+            return None
+        frac = int(parts[1]) * 10 ** (9 - len(parts[1])) if len(parts) > 1 else 0
+        return int(parts[0]) + frac / 1e9
 
-    lo, hi = bound(since, 0), bound(until, time.time())
+    mutate(path, lambda d: d.setdefault("events_calls", []).append(" ".join(args)))
+    lo, hi = bound(since, 0), bound(until, float("inf"))
+    if lo is None or hi is None:
+        bad = since if lo is None else until
+        sys.stderr.write(f'Error response from daemon: strconv.ParseInt: parsing "{bad}": invalid syntax\n')
+        return 1
     for n, ev in sorted((world.get("die_events") or {}).items()):
         if want and n not in want:
             continue
@@ -199,13 +215,20 @@ def main():
         return int(world.get(node, world.get("docker_info_rc", 0)))
 
     if op in ("rm", "stop"):
-        # --rm containers leave on their own, and `docker rm -f` removes what is left: the world drops them.
+        # --rm containers leave on their own, and `docker rm -f` removes what is left: the world drops them, and drops
+        # them only when the daemon accepted the removal. A node's docker answers on its own, so the worker's failure
+        # is its own key: a stop whose worker's daemon refuses the removal leaves rank 1 running, and the scripts have
+        # to be able to show that row.
         def drop(d, names=sys.argv[3:]):
             for n in names:
                 d["containers"].pop(n, None)
-        mutate(path, drop)
-        key = "docker_rm_rc" if op == "rm" else "docker_stop_rc"
-        return int(world.get(key, 0))
+        verb = "rm" if op == "rm" else "stop"
+        worker = os.environ.get("NODE_ROLE") == "worker"
+        key = f"worker_docker_{verb}_rc" if worker else f"docker_{verb}_rc"
+        rc = int(world.get(key, world.get(f"docker_{verb}_rc", 0)))
+        if rc == 0:
+            mutate(path, drop)
+        return rc
 
     if op == "ps":
         quiet = sys.argv[3] == "1"
@@ -220,7 +243,7 @@ def main():
         return 0
 
     if op == "events":
-        return events_op(world, sys.argv[3:])
+        return events_op(world, path, sys.argv[3:])
 
     if op == "boot_id":
         print(world.get("worker_boot_id", ""))

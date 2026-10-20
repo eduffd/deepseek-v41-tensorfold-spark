@@ -64,14 +64,19 @@ pair_required_keys() { # the keys this recipe's config must set (serve.sh has ch
     [[ "$NAME" == tensorfold-zig ]] || { echo "[dsv41-tf] $CONFIG: NAME=$NAME, scripts/run-zig.sh launches tensorfold-zig-r0 and tensorfold-zig-r1: set NAME=tensorfold-zig" >&2; exit 2; }
 }
 
-exit_lookback_since() { # the die-event window opens at the pair's last human stop: an event from before the stop is
-    # a death that stop already answered, not this one. With no marker, the config's lookback window.
+exit_lookback_since() { # the die-event window's start, printed as an epoch. docker/cli forwards --since and --until
+    # to the daemon untouched, and the daemon parses them with strconv.ParseInt of seconds (moby
+    # api/types/time/timestamp.go, v20.10 through v28.5.2): an interval like 180s is a parse error, the query answers
+    # nothing, and a rank with no cooperating launcher reads as having no witness at all. The window opens at the pair's
+    # last human stop *on this boot*, because an event from before that stop is a death that stop already answered, not
+    # this one. The marker's own boot id is the check: a stop from before the reboot says nothing about this boot's
+    # pair, and anchoring on it would stretch the window across the reboot and read a pre-reboot death as this boot.
     local mb mt now s
     read -r mb mt <<< "$(cat "$STATE_DIR/stopped" 2>/dev/null || true)"
     now=$(date +%s)
-    [[ "$mt" =~ ^[0-9]+$ ]] || { echo "${WATCH_EXIT_LOOKBACK_S}s"; return 0; }
+    [[ "$mb" == "$(boot_id)" && "$mt" =~ ^[0-9]+$ ]] || { echo "$(( now - WATCH_EXIT_LOOKBACK_S ))"; return 0; }
     s=$(( now - mt )); (( s < 0 )) && s=0
-    echo "${s}s"
+    echo "$(( now - s ))"
 }
 
 pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty when there is none. The record format is
@@ -79,14 +84,21 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
     # from this boot on the node the rank ran on, empty when it is from an earlier boot there. Rank 1 ran on the
     # worker, whose boot id is its own, and this adapter is the one place that knows which node a rank's witness
     # lives on. The fallback to the die event is for a rank with no cooperating launcher (a hand-run `docker run`, an
-    # earlyoom SIGKILL), which leaves the event and nothing else.
-    local rank=$1 rec code epoch rec_boot out t node_boot fmt ev since
+    # earlyoom SIGKILL), which leaves the event and nothing else. A die event carries no boot id, so the fallback places
+    # it by its window alone: bounded below by this boot's stop marker, and by WATCH_EXIT_LOOKBACK_S when there is
+    # none, so a "this boot" stamp on a die event is coarse by at most the lookback. A coarse definitive read heals a
+    # pair that is down, which is what the read exists for. The read speaks its own rows on stderr: stdout here is the
+    # witness, and every caller captures it.
+    local rank=$1 rec code epoch rec_boot out t node_boot fmt ev since wdir
     node_boot=$(boot_id)
     [[ "$rank" == 1 ]] && node_boot=$(worker_boot_id)
+    rec=""
     if [[ "$rank" == 0 ]]; then
         rec=$(cat "$STATE_DIR/exit-r0" 2>/dev/null || true)
     else
-        rec=$(wssh "cat '$(worker_state_dir)'/exit-r1 2>/dev/null" || true)
+        wdir=$(worker_state_dir)
+        if [[ -n "$wdir" ]]; then rec=$(wssh "cat '$wdir'/exit-r1 2>/dev/null" || true)
+        else log_err "rank 1: the worker's own config names no STATE_DIR, so rank 1's exit record cannot be read"; fi
     fi
     if [[ -n "$rec" ]]; then
         read -r code epoch rec_boot <<< "$rec"
@@ -96,7 +108,7 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
     fi
     fmt='{{.Time}} {{.Actor.Attributes.exitCode}}'
     since=$(exit_lookback_since)
-    ev="docker events --since $since --until 0s --filter event=die --filter container=$NAME-r$rank --format '$fmt'"
+    ev="docker events --since $since --until $(date +%s) --filter event=die --filter container=$NAME-r$rank --format '$fmt'"
     if [[ "$rank" == 0 ]]; then out=$(bash -c "$ev 2>/dev/null | tail -1" || true)
     else out=$(wssh "$ev 2>/dev/null | tail -1" || true); fi
     [[ -n "$out" ]] || { echo ""; return 0; }
@@ -133,7 +145,9 @@ pair_stop() { # $1 = grace seconds: the bounded drain (rank 0 answers 503 and gi
     # TF_DSV41_DRAIN_S), then the force, on both nodes, idempotent. A worker unreachable over ssh is reported and
     # stays non-fatal: rank 1 carries no client traffic. Reachability is a probe of its own (`wssh true`), not an
     # inference from the state dir being unreadable: an empty answer is a config problem, and a pair stopped by
-    # inference leaves rank 1's container up.
+    # inference leaves rank 1's container up. A removal the worker's own daemon refuses is alerted, not swallowed: the
+    # marker written after a stop makes the watchdog stand down beside a rank 1 that is still running, so the row is
+    # the only thing that says so.
     local grace=${1:-0} it gone=0 wrc=0 wdir
     # The supervisors first: a relaunched rank would come back a second after its container is removed.
     kill_supervisor head "$STATE_DIR/supervisor-r0.pid"
@@ -155,20 +169,22 @@ pair_stop() { # $1 = grace seconds: the bounded drain (rank 0 answers 503 and gi
         fi
     fi
     docker rm -f "$NAME-r0" >/dev/null 2>&1 || true
-    (( wrc == 255 )) || wssh docker rm -f "$NAME-r1" >/dev/null 2>&1 || true
+    if (( wrc != 255 )) && ! wssh docker rm -f "$NAME-r1" >/dev/null 2>&1; then
+        alert "rank 1: docker rm -f failed on the worker: $NAME-r1 is left running, and the stop marker written after this says the pair is stopped"
+    fi
 }
 
 pair_boot_decision() { # 0 = start the pair, 1 = leave it. The rows, in the order the pair's own witnesses decide:
     # rank 0 running; an exit record from an earlier boot; this boot's stop marker; a marker from an earlier boot;
     # nothing at all, which is the pair never having started on this node.
-    local state mb c0 t0 b0 e0
+    local state mb c0 b0 e0
     state=$(docker inspect -f '{{.State.Status}}' "$NAME-r0" 2>/dev/null || echo absent)
     case "$state" in
         running) log "rank 0 already running: nothing to do"; return 1 ;;
         absent) ;;
         *) log "rank 0 container $state (a container the boot left behind): starting"; return 0 ;;
     esac
-    e0=$(pair_exit 0); read -r c0 t0 b0 <<< "${e0:-}"
+    e0=$(pair_exit 0); read -r c0 _ b0 <<< "${e0:-}"
     read -r mb _ <<< "$(cat "$STATE_DIR/stopped" 2>/dev/null || true)"
     if [[ -n "$c0" && "$b0" != "$(boot_id)" ]]; then
         log "rank 0 absent with an exit witness from an earlier boot (exit $c0): starting"; return 0
