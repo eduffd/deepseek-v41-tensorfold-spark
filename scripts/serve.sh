@@ -71,6 +71,8 @@ LOG_MAX_SIZE="${LOG_MAX_SIZE:-200m}"
 LOG_MAX_FILE="${LOG_MAX_FILE:-3}"
 STATE_DIR="${STATE_DIR:-${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/dsv41-tf}"
 log() { echo "[dsv41-tf] $*"; }
+log_err() { echo "[dsv41-tf] $*" >&2; }   # for a function that answers a value on stdout: a log line there would
+                                           # be captured into the value it is asked to answer
 wssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$@"; }
 on_node() { local n=$1; shift; if [[ "$n" == head ]]; then bash -c "$*"; else wssh "$*"; fi; }
 
@@ -373,7 +375,7 @@ cmd_heal() { # everything the operator reads after a heal, and the state the nex
 capture_evidence() { # the heal's stop is a force stop and the Zig pair's containers carry --rm, so this is the last
     # moment the wedged pair's own words exist. One folder per heal, newest WATCH_EVIDENCE_KEEP kept. The tick hands
     # the verdict down in its environment; nothing here re-derives it.
-    local dir keep old body code
+    local dir keep body code
     dir="$STATE_DIR/heal-$(date -u +%Y%m%d-%H%M%S)"
     mkdir -p "$dir" || return 0
     { echo "class=${DSV41_TF_CLASS:-unknown}"
@@ -555,8 +557,9 @@ cache_files() { # the data files each node's cache must hold: the pfdense tuning
             && log "cache: config/pfdense-table.json -> $tbl on both nodes" || { log "cache: copying the pfdense table failed"; exit 1; }
     fi
     if [[ "${TF_DSV41_IMAGES:-}" == native && -n "$bvl" && "$bvl" == /cache/* ]]; then
-        local fetch="docker run --rm -i $(mount_words head) -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
-        local wfetch="docker run --rm -i $(mount_words worker) -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
+        local fetch wfetch
+        fetch="docker run --rm -i $(mount_words head) -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
+        wfetch="docker run --rm -i $(mount_words worker) -e HF_HUB_OFFLINE=0 --entrypoint sh $IMAGE -c 'test -f $bvl/bias_vl.safetensors || python -m tensorfold.families.deepseek_v41.cuda.bias_vl_fetch $bvl'"
         bash -c "$fetch" && wssh "$wfetch" && log "cache: $bvl/bias_vl.safetensors on both nodes" \
             || { log "cache: fetching the image routing bias failed (TF_DSV41_IMAGES=native needs it)"; exit 1; }
     fi

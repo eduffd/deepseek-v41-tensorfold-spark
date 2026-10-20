@@ -24,7 +24,7 @@ for key in IMAGE TF_TP_MASTER NCCL_SOCKET_IFNAME NCCL_IB_HCA MODEL_DIR ENGRAM_DI
 done
 # Pass values by environment name, preserving spaces in values.
 envs=()
-while IFS='=' read -r key value; do
+while IFS='=' read -r key _; do
     case "$key" in TF_DSV41_*|GLM53_TF_*|NCCL_*) envs+=(-e "$key");; esac
 done < <(env)
 # --check-aot: every Triton variant this env launches, checked against this rank's aot/ (host only, no GPU work).
