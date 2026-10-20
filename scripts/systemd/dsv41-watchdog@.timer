@@ -1,0 +1,13 @@
+# The tick for the profile this timer names: %i is the config basename without .env, so
+# systemctl --user enable --now dsv41-watchdog@prod-zig.timer arms CONFIG=config/prod-zig.env every minute.
+# It starts 10 min after boot, which leaves the boot fast path (dsv41-boot-start@<profile>.service) the first mover.
+[Unit]
+Description=DeepSeek-V4.1 TensorFold watchdog for %i, every minute
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
