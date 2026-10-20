@@ -21,7 +21,7 @@ pub const Settings = struct {
     }
 };
 
-/// Where a report goes: one write a line, no allocation. The default writes fd 2; `ctx` is the watch it belongs to.
+/// Where a report goes: one write per line, no allocation. `ctx` is the watch the default sink writes through.
 pub const Sink = struct {
     ctx: ?*anyopaque = null,
     line: *const fn (?*anyopaque, []const u8) void = writeStderr,
@@ -31,7 +31,7 @@ pub const Watch = struct {
     io: std.Io,
     settings: Settings,
     sink: Sink = .{},
-    exit_fn: *const fn (u8) void = exitNow, // fate.zig's seam: std.c._exit(70)
+    exit_fn: *const fn (u8) void = exitNow, // fate.zig's seam: tests replace it (it may return there)
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false), // closer writes
     exited: std.atomic.Value(bool) = .init(false), // watch thread writes
@@ -70,7 +70,6 @@ pub const Watch = struct {
         w.thread = null;
     }
 
-    /// A round starts: publish its number, both timestamps and the phase, then arm (release).
     pub fn begin(w: *Watch, round_no: u64, p: Phase) void {
         const now = nowNs(w.io);
         w.round_no.store(round_no, .release);

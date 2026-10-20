@@ -156,7 +156,7 @@ pub const LaneHost = struct {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
-    /// Installs the stall watch before `start` spawns the engine; both knobs off leaves the field null.
+    /// Installs the stall watch before `start` spawns the engine.
     pub fn startStall(h: *LaneHost, settings: stall_mod.Settings, exit_fn: *const fn (u8) void, sink: stall_mod.Sink) !void {
         if (!settings.on()) return;
         h.watch = stall_mod.Watch.init(h.io, settings);
