@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# ssh stand-in: runs the remote command string through bash with the same PATH, so the docker shim answers it.
+# world ssh_rc: 255 stands in for a node that does not answer at all (the tick's `unreachable`).
+python3 -I "$SHIM_DIR/_world.py" ssh_rc "$FIXTURE"
+rc=$?
+if [[ "$rc" != 0 ]]; then echo "ssh: connect to host port 22: No route to host" >&2; exit "$rc"; fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|-p|-l|-i|-F|-c|-E|-S) shift 2 ;;
+        -n|-q|-N|-T|-x|-v|-C|-A|-X|-Y|-4|-6|-J) shift ;;
+        *) break ;;
+    esac
+done
+shift
+[[ $# -gt 0 ]] || exit 0
+export NODE_ROLE=worker
+exec bash -c "$*"
