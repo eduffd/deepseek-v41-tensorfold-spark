@@ -4,10 +4,9 @@
     python3 -m unittest discover -s tests/scripts -t tests/scripts -p 'test_*.py'   # the same suite, no pytest
 
 Two tests are the 2026-10-19 pair wedge's repro, and both exercise the Zig lane: a pair down with this-boot exit-70
-records healing on the first tick, and a plain scripts/run-zig.sh invocation writing its rank's exit record. The Zig
-adapter (scripts/serve/zig.sh) and the record writing ship in the next unit, so those two are red until it lands.
-Everything else is green today and must stay green: the Python recipe's verdicts, the recipe key's validation, and
-the contract's definitive / debounced classes.
+records healing on the first tick, and a plain scripts/run-zig.sh invocation writing its rank's exit record. The rest
+is the contract's behavior, which must not move: the Python recipe's verdicts, the recipe key's validation, and the
+definitive / debounced classes.
 """
 from __future__ import annotations
 
@@ -58,7 +57,7 @@ class TestIncidentRepro(ShellCase):
     def test_pair_down_with_this_boot_exit70_records_heals_on_the_first_tick(self) -> None:
         """Incident repro (2026-10-19 pair wedge): a pair down whose exit-70 witnesses are from this boot heals on
         the first tick. The Zig pair runs `docker run --rm`, so its witnesses are the launcher's exit records, read
-        by the Zig adapter: red until scripts/serve/zig.sh and run-zig.sh's record writing exist."""
+        by the Zig adapter."""
         r0, r1 = self.rig.zig_names()
         self.rig.absent(r0, r1)
         self.rig.exit_record(0, "70", time.time() - 60)
@@ -69,7 +68,8 @@ class TestIncidentRepro(ShellCase):
 
         self.assertTrue(any("watch: bad tick 1 of 1:" in line and "(fail-fast exit 70)" in line for line in lines),
                         "incident repro: both ranks absent with this-boot exit-70 records and no stop marker must heal "
-                        f"on the first tick, where HEAD stood down (scripts/serve.sh:290-291): {lines} / {proc.stderr}")
+                        "on the first tick, where scripts/serve.sh at a8806b9 (:290-291) answered 'standing down': "
+                        f"{lines} / {proc.stderr}")
         self.assertTrue(any("restarting both ranks" in line for line in lines),
                         f"incident repro: the first tick must launch the heal, not log a stand-down: {lines}")
         heal_log = self.rig.wait_for_state_file_containing("heal.log", "serving on :8199")
@@ -78,8 +78,8 @@ class TestIncidentRepro(ShellCase):
 
     def test_plain_run_zig_invocation_writes_the_exit_record(self) -> None:
         """Incident repro: every scripts/run-zig.sh invocation must leave "<code> <epoch> <boot_id>" as the
-        watchdog's pair witness. The `exec` at run-zig.sh:82 today replaces the shell before any record is written,
-        so a plain launch leaves nothing behind and the pair-down tick has no witness to read."""
+        watchdog's pair witness. A plain invocation (no --detached) is the shape bin/up.sh launches, and a pair-down
+        tick has only that record to read."""
         self.rig.write_config("zig")
         self.rig.make_zig_dirs()
         self.rig.run_rc(70)

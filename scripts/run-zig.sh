@@ -96,8 +96,8 @@ if docker inspect "$name" >/dev/null 2>&1; then
 fi
 boot_id=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)
 
-run_rank() { # the container, then its exit witness. The temp + mv -f keeps a reader from ever seeing a half-written
-    # record, which is the only thing standing between a crash and a tick that reads no witness at all.
+run_rank() { # the temp + mv -f keeps a reader from ever seeing a half-written record, which is the only thing
+    # standing between a crash and a tick that reads no witness at all.
     local code tmp
     "${args[@]}" && code=0 || code=$?
     tmp="$STATE_DIR/.exit-r$rank.$$.tmp"
@@ -120,7 +120,7 @@ cap_rank_log() { # keep the newest 8 launch sections: the log a heal reads tails
     rm -f "$tmp"
 }
 
-if [[ "${DSV41_ZIG_DETACHED:-0}" == 1 ]]; then         # the supervised loop: already detached, log open, rank's own node
+if [[ "${DSV41_ZIG_DETACHED:-0}" == 1 ]]; then
     echo $$ > "$STATE_DIR/supervisor-r$rank.pid"       # the pid a human stop ends the loop by (scripts/serve/zig.sh)
     code=0
     while :; do

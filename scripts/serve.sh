@@ -43,7 +43,7 @@ case "$RECIPE" in
 esac
 adapter="scripts/serve/$RECIPE.sh"
 [[ -f "$adapter" ]] || { echo "[dsv41-tf] $CONFIG: no adapter for RECIPE=$RECIPE (write $adapter)" >&2; exit 2; }
-NAME="${NAME:-dsv41-tf}"                            # containers $NAME-r0 (head) / $NAME-r1 (worker), both recipes
+NAME="${NAME:-dsv41-tf}"
 PORT="${PORT:-8000}"
 MASTER_PORT="${MASTER_PORT:-${TF_TP_PORT:-29571}}"; TF_TP_PORT="${TF_TP_PORT:-$MASTER_PORT}"
 HEAD_IP="${HEAD_IP:-${TF_TP_MASTER:-}}"
@@ -70,12 +70,6 @@ log() { echo "[dsv41-tf] $*"; }
 wssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$@"; }
 on_node() { local n=$1; shift; if [[ "$n" == head ]]; then bash -c "$*"; else wssh "$*"; fi; }
 
-worker_config_key() { # $1 = key: its value in the worker's own copy of the config its launcher reads
-    # (config/prod-zig.env in $WORKER_REPO). The head cannot see that file, and the pair's paths differ per node
-    # (engram-r0 here, engram-r1 there), so the worker's paths can only be read from the worker.
-    [[ -n "${WORKER_REPO:-}" ]] || return 0
-    wssh "cd '$WORKER_REPO' && sed -n 's/^$1=//p' config/prod-zig.env | tail -1" 2>/dev/null | tr -d '"' || true
-}
 
 roce_cmd() { # the RoCE leg as one command string, so the head and the worker run the same test (printf keeps $d for
     # the node's own shell): every NCCL_IB_HCA device's port 1 must read ACTIVE
@@ -233,7 +227,7 @@ start_once() { # 0 ready; 1 failed; 2 canary failed; 3 short of slots
     drop_caches
     mem_gate || return 1
     IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo "$IMAGE")
-    pair_launch 1 >/dev/null &            # rank 1 over ssh, overlapping rank 0's start as it always has
+    pair_launch 1 >/dev/null &
     local wpid=$!
     pair_launch 0 >/dev/null
     wait "$wpid" || { log "rank 1 did not start"; return 1; }
@@ -453,7 +447,7 @@ watch_tick() {
     if lease_fresh; then echo 0 > "$fails_f"; log "watch: $WATCH_LEASE is fresh; standing down"; return 0; fi
     if ! flock -n "$STATE_DIR/lock" true; then log "watch: a start is in progress; standing down"; return 0; fi
     r0=$(running 0); r1=$(running 1)
-    c0=""; t0=0; b0=""; c1=""; t1=0; b1=""; mb=""; mt=0        # a missing witness or marker leaves these at "none"
+    c0=""; t0=0; b0=""; c1=""; t1=0; b1=""; mb=""; mt=0
     e0=$(pair_exit 0); e1=$(pair_exit 1)
     read -r c0 t0 b0 <<< "${e0:-}"
     read -r c1 t1 b1 <<< "${e1:-}"

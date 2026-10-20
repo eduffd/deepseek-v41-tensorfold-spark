@@ -13,9 +13,15 @@
 WATCH_EXIT_LOOKBACK_S="${WATCH_EXIT_LOOKBACK_S:-180}"
 WORKER_STATE_DIR=""
 
-worker_state_dir() { # the worker's own STATE_DIR, from the config its run-zig.sh reads (no CONFIG reaches it over
-    # ssh, so that is the launcher's default): the directory rank 1's exit record and durable log live in. Read once
-    # per process, because a tick reads rank 1's witness and may launch it.
+worker_config_key() { # $1 = key: its value in the worker's own copy of config/prod-zig.env, the file its
+    # run-zig.sh reads when no CONFIG is passed over ssh. The head cannot see that file, and the pair's paths differ
+    # per node (engram-r0 here, engram-r1 there), so the worker's paths can only be read from the worker.
+    [[ -n "${WORKER_REPO:-}" ]] || return 0
+    wssh "cd '$WORKER_REPO' && sed -n 's/^$1=//p' config/prod-zig.env | tail -1" 2>/dev/null | tr -d '"' || true
+}
+
+worker_state_dir() { # the worker's own STATE_DIR, from the config its run-zig.sh reads: the directory rank 1's exit
+    # record and durable log live in. Read once per process, because a tick reads rank 1's witness and may launch it.
     [[ -n "$WORKER_STATE_DIR" ]] && { echo "$WORKER_STATE_DIR"; return 0; }
     WORKER_STATE_DIR=$(worker_config_key STATE_DIR)
     echo "$WORKER_STATE_DIR"
