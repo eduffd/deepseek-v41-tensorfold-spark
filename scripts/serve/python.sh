@@ -3,8 +3,8 @@
 # sources this after the config and calls five things: pair_required_keys, pair_exit <rank>, pair_launch <rank>,
 # pair_stop <grace_s>, pair_boot_decision. The ports (PORT, TF_TP_PORT), the head address and the slot-line regex are
 # config keys / derived values in serve.sh, not adapter calls.
-# pair_required_keys here and scripts/run-zig.sh's own key check list the same keys on purpose (each entry point
-# validates its own contract): a key change edits both, and this file is the one place the recipe's keys are named.
+# pair_required_keys is this recipe's key check, and each entry point validates its own contract: this file is the
+# one place the Python recipe's keys are named.
 # The exit witness: this pair's containers persist, so docker inspect holds it; the Zig pair's `docker run --rm`
 # leaves nothing to inspect and reads the launcher's $STATE_DIR/exit-r<rank> record (scripts/serve/zig.sh).
 
@@ -67,7 +67,7 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
     else out=$(wssh docker inspect -f "'{{.State.ExitCode}} {{.State.FinishedAt}}'" "$NAME-r1" 2>/dev/null) && rc=0 || rc=$?; fi
     [[ $rc == 0 ]] || { echo ""; return 0; }
     read -r code fin <<< "$out"
-    fin_epoch=$(date -d "$fin" +%s 2>/dev/null || echo 0)
+    fin_epoch=$(epoch_of "$fin")
     if (( fin_epoch >= $(boot_start_epoch) )); then echo "$code $fin_epoch $(boot_id)"; else echo "$code $fin_epoch "; fi
 }
 

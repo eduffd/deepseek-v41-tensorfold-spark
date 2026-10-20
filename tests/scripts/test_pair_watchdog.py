@@ -4,10 +4,9 @@
     python3 -m unittest discover -s tests/scripts -t tests/scripts -p 'test_*.py'   # the same suite, no pytest
 
 Two tests are the 2026-10-19 pair wedge's repro, and both exercise the Zig lane: a pair down with this-boot exit-70
-records healing on the first tick, and a plain scripts/run-zig.sh invocation writing its rank's exit record. The Zig
-adapter (scripts/serve/zig.sh) and the record writing ship in the next unit, so those two are red until it lands.
-Everything else is green today and must stay green: the Python recipe's verdicts, the recipe key's validation, and
-the contract's definitive / debounced classes.
+records healing on the first tick, and a plain scripts/run-zig.sh invocation writing its rank's exit record. The rest
+is the contract's behavior, which must not move: the Python recipe's verdicts, the recipe key's validation, and the
+definitive / debounced classes.
 """
 from __future__ import annotations
 
@@ -43,7 +42,7 @@ class TestStalledVerdict(ShellCase):
         self.rig.container(r0); self.rig.container(r1)
         self.rig.health("503", STALLED_BODY)
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: /health 503" in line for line in lines),
@@ -58,18 +57,19 @@ class TestIncidentRepro(ShellCase):
     def test_pair_down_with_this_boot_exit70_records_heals_on_the_first_tick(self) -> None:
         """Incident repro (2026-10-19 pair wedge): a pair down whose exit-70 witnesses are from this boot heals on
         the first tick. The Zig pair runs `docker run --rm`, so its witnesses are the launcher's exit records, read
-        by the Zig adapter: red until scripts/serve/zig.sh and run-zig.sh's record writing exist."""
+        by the Zig adapter."""
         r0, r1 = self.rig.zig_names()
         self.rig.absent(r0, r1)
         self.rig.exit_record(0, "70", time.time() - 60)
         self.rig.exit_record(1, "70", time.time() - 60)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1:" in line and "(fail-fast exit 70)" in line for line in lines),
                         "incident repro: both ranks absent with this-boot exit-70 records and no stop marker must heal "
-                        f"on the first tick, where HEAD stood down (scripts/serve.sh:290-291): {lines} / {proc.stderr}")
+                        "on the first tick, where scripts/serve.sh at a8806b9 (:290-291) answered 'standing down': "
+                        f"{lines} / {proc.stderr}")
         self.assertTrue(any("restarting both ranks" in line for line in lines),
                         f"incident repro: the first tick must launch the heal, not log a stand-down: {lines}")
         heal_log = self.rig.wait_for_state_file_containing("heal.log", "serving on :8199")
@@ -78,8 +78,8 @@ class TestIncidentRepro(ShellCase):
 
     def test_plain_run_zig_invocation_writes_the_exit_record(self) -> None:
         """Incident repro: every scripts/run-zig.sh invocation must leave "<code> <epoch> <boot_id>" as the
-        watchdog's pair witness. The `exec` at run-zig.sh:82 today replaces the shell before any record is written,
-        so a plain launch leaves nothing behind and the pair-down tick has no witness to read."""
+        watchdog's pair witness. A plain invocation (no --detached) is the shape bin/up.sh launches, and a pair-down
+        tick has only that record to read."""
         self.rig.write_config("zig")
         self.rig.make_zig_dirs()
         self.rig.run_rc(70)
@@ -107,7 +107,7 @@ class TestHeal(ShellCase):
         self.rig.container(r1, running="false", status="exited", exit_code="70", finished_age_s=60)
         self.rig.log_line(r0, "[tensorfold] serving: 4 slot(s) x 300000 tokens; health strict")
 
-        proc = self.rig.tick("python", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("python", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: rank 0 false (fail-fast exit 70)" in line for line in lines),
@@ -129,7 +129,7 @@ class TestStandDowns(ShellCase):
         self.rig.state_file("fails", "2")
         lease = self.rig.lease()
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
 
         self.assertEqual(self.rig.stdout_lines(proc), [f"[dsv41-tf] watch: {lease} is fresh; standing down"])
         self.assertEqual(self.rig.state_file("fails"), "0", "standing down clears the bad-tick streak")
@@ -141,7 +141,7 @@ class TestStandDowns(ShellCase):
         r0, r1 = self.rig.py_names()
         self.rig.absent(r0, r1)
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
 
         self.assertEqual(self.rig.stdout_lines(proc), [PY_DOWN_NEVER], f"{proc.stdout}{proc.stderr}")
         self.assertEqual(self.rig.state_file("fails"), "0", "standing down clears the bad-tick streak")
@@ -157,7 +157,7 @@ class TestDefinitiveAndDebounced(ShellCase):
         self.rig.container(r1, running="false", status="exited", exit_code="1", finished_age_s=300)
         self.rig.state_file("last_heal", str(int(time.time()) - 100))
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 3: rank 0 false" in line for line in lines),
@@ -231,14 +231,16 @@ class TestPythonRecipeIdentity(ShellCase):
                 "1", 1)),
             "rank0_exit1": (rank0_exit1, lambda r: (bad_tick("rank 0 false"), "1", 0)),
             "worker_unreachable": (worker_unreachable, lambda r: (
-                ["[dsv41-tf] watch: worker unreachable over ssh (not counted)"], "0", 0)),
+                ["[dsv41-tf] ALERT: worker unreachable over ssh: rank 1 unwatched, so a rank-1-only wedge heals "
+                 "from nothing",
+                 "[dsv41-tf] watch: worker unreachable over ssh (not counted)"], "0", 0)),
         }
 
         for state, (setup, expect) in table.items():
             with self.subTest(state=state):
                 rig = self.new_rig()
                 setup(rig)
-                proc = rig.tick("python")
+                proc = rig.tick_writing_config("python")
                 want_lines, want_fails, want_rc = expect(rig)
 
                 self.assertEqual(rig.stdout_lines(proc), want_lines, f"{state} ({proc.stderr})")

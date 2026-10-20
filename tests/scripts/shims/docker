@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # docker stand-in: answers from the fixture world, never touching a real daemon.
-cmd="${1:-}"; [[ $# -gt 0 ]] && shift
-fmt=""; pos=()
+cmd="${1:-}"; shift 2>/dev/null || true
+args=("$@")
+# -f means `--format <fmt>` to inspect and image, and means nothing to rm; the name after it must survive.
+case "$cmd" in inspect|image) fmtflag=1 ;; *) fmtflag=0 ;; esac
+fmt=""; quiet=0; filters=(); pos=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -f|--format) fmt="$2"; shift 2 ;;
+        -f) if (( fmtflag )); then fmt="$2"; shift 2; else shift; fi ;;
+        --format) fmt="$2"; fmtflag=1; shift 2 ;;
+        -q|--quiet) quiet=1; shift ;;
+        -a|-i|-d) shift ;;
+        --filter) filters+=("$2"); shift 2 ;;
         -t|--type|--tail|-n) shift 2 ;;
         --name|-v|-e|-p|-w|--entrypoint|--gpus|--ipc|--network|--device|--ulimit|--cap-add|--log-opt|--user|--shm-size|--restart|-H) shift 2 ;;
         --*) shift ;;
@@ -14,13 +21,15 @@ while [[ $# -gt 0 ]]; do
 done
 last="${pos[$(( ${#pos[@]} - 1 ))]:-}"
 case "$cmd" in
-inspect) exec python3 -I "$SHIM_DIR/_world.py" inspect "$FIXTURE" "$fmt" "$last" ;;
-image)   exec python3 -I "$SHIM_DIR/_world.py" image "$FIXTURE" "$fmt" "$last" ;;
+inspect) exec python3 -I "$SHIM_DIR/_world.py" inspect "$FIXTURE" "$fmt" "${pos[$(( ${#pos[@]} - 1 ))]:-}" ;;
+# `docker image inspect` puts the subcommand in front of the name, and serve.sh reads an image by name only.
+image)   exec python3 -I "$SHIM_DIR/_world.py" image "$FIXTURE" "$fmt" "${pos[$(( ${#pos[@]} - 1 ))]:-}" ;;
 logs)    exec python3 -I "$SHIM_DIR/_world.py" logs "$FIXTURE" "$last" ;;
-run)     exec python3 -I "$SHIM_DIR/_world.py" run "$FIXTURE" ;;
+run)     exec python3 -I "$SHIM_DIR/_world.py" run "$FIXTURE" "${args[@]}" ;;
 info)    exec python3 -I "$SHIM_DIR/_world.py" info "$FIXTURE" ;;
-rm)      exec python3 -I "$SHIM_DIR/_world.py" rm "$FIXTURE" ;;
-stop)    exec python3 -I "$SHIM_DIR/_world.py" stop "$FIXTURE" ;;
-ps)      exit 0 ;;
+rm)      exec python3 -I "$SHIM_DIR/_world.py" rm "$FIXTURE" "${pos[@]}" ;;
+stop)    exec python3 -I "$SHIM_DIR/_world.py" stop "$FIXTURE" "${pos[@]}" ;;
+ps)      exec python3 -I "$SHIM_DIR/_world.py" ps "$FIXTURE" "$quiet" "${filters[@]}" ;;
+events)  exec python3 -I "$SHIM_DIR/_world.py" events "$FIXTURE" "$fmt" "$fmtflag" "${args[@]}" ;;
 *)       exit 0 ;;
 esac

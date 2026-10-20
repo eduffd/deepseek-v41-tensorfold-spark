@@ -1,5 +1,32 @@
 # What is not solved
 
+- **A wedged pair heals itself, and the wedge's root cause is open.** On 2026-10-19 the Zig pair stopped issuing
+  rounds: `/health` answered 503 with the stall labels, `rounds_total` froze at 383,335, in-flight requests grew from 22
+  to 24, rank 1's GPU sat at 96%, and clients saw a server that accepted work and answered nothing (evidence in
+  `results/verify/20261019-213006/`). A round in flight never returns, rank 1 waits in the TP exchange, and nothing in
+  the engine ends it. The Zig engine has no stall self-exit (`TF_DSV41_STALL_EXIT_S` is implemented in the vendor
+  Python family only, [issue #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1)), no deadline on any
+  peer wait ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)), a watchdog on rank 0 that is
+  blind to a rank-1-side wedge ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)), and a mailbox
+  timeout that leaves stale buffers live
+  ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)). That day's recovery was a human: stop the
+  pair, start it again, ready in 122 s, about 80 minutes after the pair went dead. The self-heal watchdog
+  ([OPERATIONS](OPERATIONS.md) "Watchdog and start at boot") bounds the outage instead. An engine-labelled 503 is a
+  definitive verdict, so the pair heals on the tick that sees it, at most once every `WATCH_FF_MIN_HEAL` (120 s), and
+  serving returns in about 3.5 minutes of arithmetic: at most `WATCH_INTERVAL` (60 s) to notice, the heal's
+  `WATCH_HEAL_GRACE` drain (20 s as both shipped Zig profiles set it; the scripts default is 15), and the measured
+  122 s warm relaunch. That sum is a floor for the wedge family, not its expected time: the 122 s was measured on a
+  pair drained by `bin/up.sh` and not on a wedge heal, and the heal's own path is outside the sum (the worker's drain
+  poll runs up to 50 s when a wedged rank 1 lingers, then the force stop, the evidence capture and the preflight).
+  The 122 s is measured on the pair; the notice and drain terms are the config's own numbers, and
+  no end-to-end outage drill has timed the sum on the nodes yet.
+  `WATCH_MAX_HEALS` (5) stops the
+  healing of a pair that keeps coming back wedged, and each heal writes its evidence to `$STATE_DIR/heal-<utc>/` before
+  the force stop destroys the pair. The idle probe (`WATCH_PROBE`) covers the shape rank 0 cannot report, a wedged
+  rank 1 beside an idle rank 0. The wedge itself is unfixed. Upstream
+  [issue #38](https://github.com/jayleaton/deepseek-v41-tensorfold-spark/issues/38) reports the same last two engine
+  lines and the same rank-0 stack.
+
 - **4 streams on the mixed cell are below the 120 target.** C4 mixed decode aggregate is ~101 tok/s (136 while all
   four streams are live). The cell's wall is mostly its prose stream finishing alone; 4 distinct code streams are
   estimated at ~125-135 but that cell has not been measured. The built-but-off `TF_DSV41_SPEC_NUCLEUS` measured
@@ -30,3 +57,12 @@
   `TF_DSV41_DRAFT_VOCAB=<file>` and `tests/test_dsv41_draft_head.py::test_shipped_ranking` fails. A ranking of your
   own traffic (`scripts/campaign/draftvocab.py`) or of public text (the GLM recipe's `bench/draftvocab_public.py`
   method on this tokenizer) can be used.
+- **The watchdog's stand-downs are 20 minutes, not ownership.** Two open issues on the actor side, both found in
+  review of the watchdog wave. The pair's Mac-side teardown touches only `WATCH_LEASE`, and a lease mutes the tick for
+  `WATCH_LEASE_MIN` (20 min), while the both-absent verdict is definitive on any exit code, a clean exit 0 included,
+  so a pair taken down by hand is relaunched once the lease ages
+  ([#6](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/6)); the stop marker is the ownership
+  transfer, and the teardown path does not write it. And `WORKER_CONFIG` is a knob whose two halves disagree: the
+  worker's launcher takes the profile's config, while every head-side read of the worker parses
+  `config/prod-zig.env`, so rank 1's record, log and supervisor pid land where the watchdog does not look
+  ([#5](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/5)).
