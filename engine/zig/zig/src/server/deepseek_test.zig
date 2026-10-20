@@ -193,8 +193,7 @@ fn delta(ev: json.Value) json.Value {
     return ev.get("choices").?.array[0].get("delta").?;
 }
 
-/// The first event whose ``type`` is ``kind``; null when the stream has no such event. The Messages and
-/// Responses wires prefix each event with an ``event:`` line, so this walks the ``data:`` lines itself.
+/// The first event whose ``type`` is ``kind``, or null; skips the ``event:`` lines Messages and Responses streams add.
 fn eventOfType(a: Allocator, body: []const u8, kind: []const u8) !?json.Value {
     var lines = std.mem.splitScalar(u8, body, '\n');
     while (lines.next()) |line| {

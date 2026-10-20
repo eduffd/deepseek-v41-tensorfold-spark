@@ -111,8 +111,7 @@ const Wire = struct {
     fn open(ctx: *anyopaque, prompt_len: usize) error{Closed}!void {
         const w: *Wire = @ptrCast(@alignCast(ctx));
         w.opened = true;
-        // the head counts the whole prompt and message_delta splits it into the same total, as the Anthropic
-        // streaming spec reads it
+        // the head counts the whole prompt; message_delta splits it into the same total, per Anthropic's streaming spec
         if (prompt_len > 0) {
             const n = json.intValue(w.reply.a, prompt_len) catch return error.Closed;
             w.reply.tokens.object.put(w.reply.a, "input_tokens", n) catch return error.Closed;

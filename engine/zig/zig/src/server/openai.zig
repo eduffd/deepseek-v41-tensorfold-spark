@@ -622,7 +622,7 @@ const Run = struct {
         const last = r.chunk(.{ .string = "" }, if (reply.finish_reason.len > 0) reply.finish_reason else "length") catch return;
         if (compaction) |s| compact.stamp(&cx, &reply, s) catch return;
         if (r.srv.config.wire == .spark) {
-            // a Messages stream sends no stream_options, so its usage must ride on the last chunk
+            // usage rides the last chunk, include_usage or not (Messages sends none); server.py only when asked (#49)
             last.object.put(a, "usage", r.usage(&reply) catch return) catch return;
             r.extras(last.object, &reply) catch return;
             r.emit(last) catch return;

@@ -16,8 +16,7 @@ const known_diffs = [_]Known{
     .{ .group = "metrics-open", .name = "metrics" },
     .{ .group = "metrics-open", .name = "v1-metrics" },
     .{ .group = "keys", .name = "metrics-counted" },
-    // The Anthropic stream heads carry the prompt's token count (port of upstream #672 by kky42); the frozen
-    // Python goldens predate it and open with 0, so these six bodies may differ on purpose.
+    // Anthropic stream heads count the prompt (port of upstream #672 by kky42); frozen Python goldens open with 0.
     .{ .group = "anthropic", .name = "plain-stream" },
     .{ .group = "anthropic", .name = "thinking-stream" },
     .{ .group = "anthropic", .name = "tool-use-stream" },
@@ -225,8 +224,7 @@ fn named(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) []const 
     return std.fmt.allocPrint(a, "{s}" ++ fmt, .{gated_prefix} ++ args) catch gated_prefix ++ "the usage blob is malformed";
 }
 
-/// One Messages usage blob as a prompt total: input_tokens, cache_read_input_tokens, cache_creation_input_tokens.
-/// A cache field Anthropic omits (nothing was cached) reads as 0; anything not an integer names the field.
+/// A Messages usage blob's prompt total (input, cache_read, cache_creation); an omitted cache field reads as 0.
 fn usageTotal(a: std.mem.Allocator, usage: std.json.Value, kind: []const u8) Usage {
     if (usage != .object) return .{ .problem = named(a, "{s}'s usage is not an object", .{kind}) };
     var total: i64 = 0;

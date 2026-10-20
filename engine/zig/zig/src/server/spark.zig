@@ -2,11 +2,6 @@
 //! ``glm5_next/spark/server.py`` with ``health.py`` and ``reqlog.py``) answer, for clients, dashboards and the ops
 //! scripts written against them. ``Wire.spark`` selects it (``Config.wire``); ``Wire.tensorfold`` is upstream's.
 //!
-//! - **Replies**: ids ``chatcmpl-`` / ``cmpl-`` and 24 hex digits; ``model`` is always the served name; ``usage``
-//!   without ``completion_tokens_details``; the engine's stats under ``tensorfold``; a stream's usage in its
-//!   last chunk, asked for by ``stream_options.include_usage`` or not, so that option is a no-op on this wire.
-//!   The parity reference diverges here: ``glm5_next/spark/server.py`` puts usage on a stream's last chunk only
-//!   when asked, and the five re-baselined stream bodies in ``fixtures/serve/wire.jsonl`` carry the divergence (#49).
 //! - **Errors**: ``{"error": {"message", "type", "code"?, "param"?}}``; an unknown path ``{"error": "not found"}``;
 //!   the context limit in OpenAI's and vLLM's words, which clients parse to compact.
 //! - **/health** (``Health``): ok / fatal / stalled / inflight and upstream's live totals (``drafted_total``,
@@ -23,12 +18,13 @@ const json = @import("json");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
+/// ``spark`` replies use the served ``model``, no ``completion_tokens_details``, the engine stats under ``tensorfold``.
 pub const Wire = enum { tensorfold, spark };
 /// /health's ``streams``: a batch engine's slots decoding, prefilling, and in all.
 pub const Streams = struct { decoding: u32, prefilling: u32, max: u32 };
 pub const Mode = enum { basic, strict };
 
-/// The reply id's random hex digits (``uuid4().hex[:24]``).
+/// The random hex digits after a reply id's ``chatcmpl-`` / ``cmpl-`` (``uuid4().hex[:24]``).
 pub const id_digits = 24;
 
 pub const LogSettings = struct {
