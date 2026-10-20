@@ -8,10 +8,11 @@
 # validates its own contract): a key change edits both, and this file is the one place the recipe's keys are named.
 # The exit witness: this pair runs `docker run --rm --init`, so a rank leaves no container for docker inspect to
 # answer. scripts/run-zig.sh writes "$STATE_DIR/exit-r<rank>" as "<code> <epoch> <boot_id>" on every invocation, and
-# rank 1's record lives in the worker's own STATE_DIR. The Python recipe's containers persist and read inspect
-# instead (scripts/serve/python.sh).
+# rank 1's record lives in the worker's own STATE_DIR, stamped with the worker's boot id: the pair's two nodes
+# reboot independently. The Python recipe's containers persist and read inspect instead (scripts/serve/python.sh).
 WATCH_EXIT_LOOKBACK_S="${WATCH_EXIT_LOOKBACK_S:-180}"
 WORKER_STATE_DIR=""
+WORKER_BOOT=""
 
 worker_config_key() { # $1 = key: its value in the worker's own copy of config/prod-zig.env, the file its
     # run-zig.sh reads when no CONFIG is passed over ssh. The head cannot see that file, and the pair's paths differ
@@ -27,16 +28,26 @@ worker_state_dir() { # the worker's own STATE_DIR, from the config its run-zig.s
     echo "$WORKER_STATE_DIR"
 }
 
+worker_boot_id() { # the worker's own boot id, read over ssh. The pair's two nodes reboot independently, so a
+    # witness from rank 1's node is placed in time against that node's boot, never the head's. Read once per process
+    # like the worker's state dir. Empty when the worker does not answer, which is the tick's stand-down row.
+    [[ -n "$WORKER_BOOT" ]] && { echo "$WORKER_BOOT"; return 0; }
+    WORKER_BOOT=$(wssh "cat /proc/sys/kernel/random/boot_id 2>/dev/null" || true)
+    echo "$WORKER_BOOT"
+}
+
 kill_supervisor() { # $1 = head|worker, $2 = that node's supervisor pid file: end the supervised relaunch loop
-    # before its containers are removed, by the pid the loop recorded. By pid, never by a command-line pattern: a
-    # pattern matches the ssh shell carrying it, which reads back as a worker that is unreachable, and a stop that
-    # kills the channel stops the pair on one node only. The pid is checked against the launcher before the kill,
-    # because the file outlives the loop it names.
+    # before its containers are removed, by the pid the loop recorded. By pid, never by a command-line pattern of
+    # the whole command: a pattern matches the ssh shell carrying it, which reads back as a worker that is
+    # unreachable, and a stop that kills the channel stops the pair on one node only. The pid is checked against the
+    # loop's own flag before the kill, because the file outlives the loop it names and pids get reused. The kill
+    # takes the process group: a loop killed while its launch is in flight leaves that launch running, and the rank
+    # comes back behind the stop.
     local node=$1 file=$2
     [[ -n "$file" ]] || return 0
     on_node "$node" "pid=\$(cat '$file' 2>/dev/null); rm -f '$file'
 pid=\${pid//[^0-9]/}
-[[ -n \"\$pid\" ]] && ps -p \"\$pid\" -o args= 2>/dev/null | grep -q 'run-zig.sh' && kill \"\$pid\" 2>/dev/null
+[[ -n \"\$pid\" ]] && ps -p \"\$pid\" -o args= 2>/dev/null | grep -q -- '--detached' && kill -- -\"\$pid\" 2>/dev/null
 true"
 }
 
@@ -51,11 +62,25 @@ pair_required_keys() { # the keys this recipe's config must set (serve.sh has ch
     [[ "$NAME" == tensorfold-zig ]] || { echo "[dsv41-tf] $CONFIG: NAME=$NAME, scripts/run-zig.sh launches tensorfold-zig-r0 and tensorfold-zig-r1: set NAME=tensorfold-zig" >&2; exit 2; }
 }
 
+exit_lookback_since() { # the die-event window opens at the pair's last human stop: an event from before the stop is
+    # a death that stop already answered, not this one. With no marker, the config's lookback window.
+    local mb mt now s
+    read -r mb mt <<< "$(cat "$STATE_DIR/stopped" 2>/dev/null || true)"
+    now=$(date +%s)
+    [[ "$mt" =~ ^[0-9]+$ ]] || { echo "${WATCH_EXIT_LOOKBACK_S}s"; return 0; }
+    s=$(( now - mt )); (( s < 0 )) && s=0
+    echo "${s}s"
+}
+
 pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty when there is none. The record format is
-    # parsed here and only here. A record from an earlier boot answers no boot id, which is what makes the tick read it
-    # as an earlier boot. One function, one fallback chain: the launcher's record, then the die event (a hand-run
-    # `docker run` or an earlyoom SIGKILL has no cooperating launcher, so it leaves the event and nothing else).
-    local rank=$1 rec code epoch rec_boot out t
+    # parsed here and only here, and the boot id is answered in the head's terms: the head's own when the death is
+    # from this boot on the node the rank ran on, empty when it is from an earlier boot there. Rank 1 ran on the
+    # worker, whose boot id is its own, and this adapter is the one place that knows which node a rank's witness
+    # lives on. One function, one fallback chain: the launcher's record, then the die event (a hand-run `docker run`
+    # or an earlyoom SIGKILL has no cooperating launcher, so it leaves the event and nothing else).
+    local rank=$1 rec code epoch rec_boot out t node_boot fmt ev since
+    node_boot=$(boot_id)
+    [[ "$rank" == 1 ]] && node_boot=$(worker_boot_id)
     if [[ "$rank" == 0 ]]; then
         rec=$(cat "$STATE_DIR/exit-r0" 2>/dev/null || true)
     else
@@ -63,18 +88,15 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
     fi
     if [[ -n "$rec" ]]; then
         read -r code epoch rec_boot <<< "$rec"
-        [[ "$rec_boot" == "$(boot_id)" ]] && { echo "$code ${epoch:-0} $rec_boot"; return 0; }
+        [[ -n "$node_boot" && "$rec_boot" == "$node_boot" ]] && { echo "$code ${epoch:-0} $(boot_id)"; return 0; }
         echo "$code ${epoch:-0} "
         return 0
     fi
-    local fmt='{{.Time}} {{.Attributes.exitCode}}' ev
-    if [[ "$rank" == 0 ]]; then
-        ev="docker events --since ${WATCH_EXIT_LOOKBACK_S}s --until 0s --filter event=die --filter container=$NAME-r0 --format '$fmt'"
-        out=$(bash -c "$ev 2>/dev/null | tail -1" || true)
-    else
-        ev="docker events --since ${WATCH_EXIT_LOOKBACK_S}s --until 0s --filter event=die --filter container=$NAME-r1 --format '$fmt'"
-        out=$(wssh "$ev 2>/dev/null | tail -1" || true)
-    fi
+    fmt='{{.Time}} {{.Actor.Attributes.exitCode}}'
+    since=$(exit_lookback_since)
+    ev="docker events --since $since --until 0s --filter event=die --filter container=$NAME-r$rank --format '$fmt'"
+    if [[ "$rank" == 0 ]]; then out=$(bash -c "$ev 2>/dev/null | tail -1" || true)
+    else out=$(wssh "$ev 2>/dev/null | tail -1" || true); fi
     [[ -n "$out" ]] || { echo ""; return 0; }
     read -r t code <<< "$out"
     echo "$code $(epoch_of "$t") $(boot_id)"
@@ -82,12 +104,14 @@ pair_exit() { # $1 = rank: its exit witness "<code> <epoch> <boot_id>", empty wh
 
 pair_launch() { # $1 = rank: launch it detached through scripts/run-zig.sh --detached, the way bin/up.sh does it (the
     # ssh channel returns; the launcher lives on its node, into the durable log of its own state dir). Answer 0 once
-    # docker ps shows the container, 1 with the log tail when it never appears.
-    local rank=$1 rank_log _i st
+    # docker ps shows the container, 1 with the log tail when it never appears. rank 1 reads the config of its own
+    # node, named here by path so a profile config (WORKER_CONFIG) reaches the worker's launcher.
+    local rank=$1 rank_log _i st wdir wconfig
     mkdir -p "$STATE_DIR"
     if [[ "$rank" == 1 ]]; then
-        rank_log="$(worker_state_dir)/run-zig-r1.log"
-        wssh "cd '$WORKER_REPO' && setsid nohup scripts/run-zig.sh 1 --detached >> '$rank_log' 2>&1 < /dev/null & sleep 1; exit 0" >/dev/null 2>&1 || true
+        wdir=$(worker_state_dir); wconfig="$WORKER_REPO/${WORKER_CONFIG:-config/prod-zig.env}"
+        rank_log="$wdir/run-zig-r1.log"
+        wssh "mkdir -p '$wdir' && cd '$WORKER_REPO' && CONFIG='$wconfig' setsid nohup scripts/run-zig.sh 1 --detached >> '$rank_log' 2>&1 < /dev/null & sleep 1; exit 0" >/dev/null 2>&1 || true
     else
         setsid nohup scripts/run-zig.sh 0 --detached >> "$STATE_DIR/run-zig-r0.log" 2>&1 < /dev/null &
     fi
@@ -105,20 +129,28 @@ pair_launch() { # $1 = rank: launch it detached through scripts/run-zig.sh --det
 
 pair_stop() { # $1 = grace seconds: the bounded drain (rank 0 answers 503 and gives requests in progress
     # TF_DSV41_DRAIN_S), then the force, on both nodes, idempotent. A worker unreachable over ssh is reported and
-    # stays non-fatal: rank 1 carries no client traffic.
+    # stays non-fatal: rank 1 carries no client traffic. Reachability is a probe of its own (`wssh true`), not an
+    # inference from the state dir being unreadable: an empty answer is a config problem, and a pair stopped by
+    # inference leaves rank 1's container up.
     local grace=${1:-0} it gone=0 wrc=0 wdir
     # The supervisors first: a relaunched rank would come back a second after its container is removed.
     kill_supervisor head "$STATE_DIR/supervisor-r0.pid"
-    wdir=$(worker_state_dir)
-    if [[ -n "$wdir" ]]; then kill_supervisor worker "$wdir/supervisor-r1.pid"; else wrc=255; fi
-    (( wrc == 255 )) && log "rank 1: the worker is unreachable over ssh; its container and launcher are untouched from here"
+    wssh true >/dev/null 2>&1 && wrc=0 || wrc=$?
+    if (( wrc == 255 )); then
+        log "rank 1: the worker is unreachable over ssh; its container and launcher are untouched from here"
+    else
+        wdir=$(worker_state_dir)
+        kill_supervisor worker "$wdir/supervisor-r1.pid"
+    fi
     if (( grace > 0 )); then
         docker stop -t "$grace" "$NAME-r0" >/dev/null 2>&1 || true
-        for (( it = 0; it < (grace + 30) / 5; it++ )); do
-            if wssh docker inspect "$NAME-r1" >/dev/null 2>&1; then sleep 5; else gone=1; break; fi
-        done
-        [[ "$gone" == 1 ]] || log "rank 1 still present after the ${grace}s drain: stopping it directly (it carries no client traffic)"
-        wssh docker stop -t "$grace" "$NAME-r1" >/dev/null 2>&1 || true
+        if (( wrc != 255 )); then
+            for (( it = 0; it < (grace + 30) / 5; it++ )); do
+                if wssh docker inspect "$NAME-r1" >/dev/null 2>&1; then sleep 5; else gone=1; break; fi
+            done
+            [[ "$gone" == 1 ]] || log "rank 1 still present after the ${grace}s drain: stopping it directly (it carries no client traffic)"
+            wssh docker stop -t "$grace" "$NAME-r1" >/dev/null 2>&1 || true
+        fi
     fi
     docker rm -f "$NAME-r0" >/dev/null 2>&1 || true
     (( wrc == 255 )) || wssh docker rm -f "$NAME-r1" >/dev/null 2>&1 || true

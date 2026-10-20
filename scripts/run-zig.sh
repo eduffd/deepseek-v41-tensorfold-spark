@@ -133,10 +133,17 @@ if [[ "${DSV41_ZIG_DETACHED:-0}" == 1 ]]; then
         [[ "$code" == 0 || "$code" == 70 ]] && break
         sleep 5
     done
-    exit "$code"
+    rm -f "$STATE_DIR/supervisor-r$rank.pid"           # the pid names a live loop or nothing: a stop that kills a
+    exit "$code"                                       # reused pid kills a stranger
 fi
 
 if [[ "${2:-}" == --detached ]]; then
+    spid=$(cat "$STATE_DIR/supervisor-r$rank.pid" 2>/dev/null || true)
+    spid=${spid//[^0-9]/}
+    if [[ -n "$spid" ]] && ps -p "$spid" -o args= 2>/dev/null | grep -q -- '--detached'; then
+        echo "rank $rank: a supervised loop (pid $spid) already runs this rank: scripts/serve.sh stop ends it" >&2
+        exit 1
+    fi
     setsid nohup env DSV41_ZIG_DETACHED=1 bash "${BASH_SOURCE[0]}" "$rank" --detached \
         >> "$rank_log" 2>&1 < /dev/null &
     exit 0
