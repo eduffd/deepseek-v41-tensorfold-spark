@@ -164,15 +164,20 @@ counter, marker, log or heal folder is shared between them.
   on every invocation, rank 1's record living on the worker's own `STATE_DIR` and stamped with the *worker's* boot id:
   the two nodes reboot independently, and rank 1's death belongs to its node's boot, never the head's. The adapter
   compares each rank's record with the boot of the node it ran on and answers the tick in the head's terms. When no
-  record exists, which covers a hand-run `docker run` and an earlyoom SIGKILL, the `die` event is the witness:
-  `WATCH_EXIT_LOOKBACK_S` (180 s) back, or from the last stop marker forward when there is one, so a death that stop
-  answered is not read as this one. A witness from an earlier boot is an earlier boot's death, never this one's.
+  record exists, which covers a hand-run `docker run` and an earlyoom SIGKILL, the `die` event is the witness, read
+  over a window given in epoch seconds: `--since`/`--until` go to the daemon untouched, and the daemon parses them as
+  seconds (`180s` is a parse error, and the read answers nothing). The window reaches `WATCH_EXIT_LOOKBACK_S` (180 s)
+  back, or from the last stop marker forward when that marker is from this boot, so a death that stop answered is not
+  read as this one, and a stop from before the reboot anchors nothing. A witness from an earlier boot is an earlier
+  boot's death, never this one's.
 - The tick stands down while the start lock is held (a start, a heal's restart, a stop), while rank 0 is loading
   (`WATCH_GRACE`), after a deliberate
   `scripts/serve.sh stop` in the same boot (the stop marker), when both ranks are absent with no witness and no marker
   (the pair never started on this node), and while `WATCH_LEASE` is fresh (`WATCH_LEASE_MIN` 20 min, re-touchable). The
   marker owns the human teardown, and only that. A worker that does not answer ssh is not counted either, and it is
-  alerted by name: from the head, rank 1 is unwatched, and half a pair answers `/health` 200 by itself.
+  alerted by name: from the head, rank 1 is unwatched, and half a pair answers `/health` 200 by itself. A worker that
+  answers ssh and names no `STATE_DIR` in its own config is said the same way, on stderr beside a debounced bad tick:
+  rank 1's record cannot be read, which is a config fault, not a rank with no death.
 - A start the canary refused is a pair stopped on purpose: the canary-failed start writes the stop marker, so the
   watchdog leaves the pair the canary rejected for the human to read (`$STATE_DIR/canary-fail-r0.log`,
   `canary-fail-r1.log`). A `stop` and a heal both take the start lock, non-blocking: neither queues behind a start it
@@ -192,7 +197,8 @@ counter, marker, log or heal folder is shared between them.
   it on, since the idle wedge is the family the incident log has and the engine cannot report.
 - `scripts/serve.sh heal` prints what to read after a heal: the last heal and its age, `fails`, the consecutive heal
   count, the lease and lock state, both exit witnesses, the stop marker, the `heal.log` tail and both ranks' log tails.
-  `WATCH_ALERT=<cmd>` is called with the text of every alert.
+  `WATCH_ALERT=<cmd>` is called with the text of every alert, and a tick that keeps alerting calls it every tick: a
+  worker that does not answer ssh alerts once a minute, so a hook that pages has to dedup.
 - `scripts/boot-start.sh` is the `dsv41-boot-start.service` oneshot, and
   `dsv41-boot-start@<config-basename>.service` names a profile. After a reboot, it starts the service if it was serving
   (or crashed) before, once docker, the worker and the RoCE ports are up. `BOOT_DRY_RUN=1` shows the decision.

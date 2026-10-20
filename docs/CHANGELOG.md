@@ -18,6 +18,17 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   state a wedged rank 1 leaves rank 0 reporting. Units, knobs and stand-downs are in
   [OPERATIONS](OPERATIONS.md) ("Watchdog and start at boot") and [ZIG-SERVE](ZIG-SERVE.md) ("Keep it supervised"); the
   wedge's root cause stays open in [KNOWN-ISSUES](KNOWN-ISSUES.md).
+- **The watchdog's die-event witness answered nothing on a real node** (this update, from an independent review of the
+  watchdog wave). The fallback's window was emitted as `--since 180s --until 0s`, and docker/cli forwards `--since` and
+  `--until` to the daemon untouched, where they are parsed as epoch seconds (`api/types/time/timestamp.go`): an interval
+  is a parse error, the daemon answers 400, and the scripts sent that failure to `/dev/null`. So the witness meant for a
+  rank with no cooperating launcher (a hand-run `docker run`, an earlyoom SIGKILL) read empty on every node, and the
+  suite passed because its `docker events` shim accepted the interval forms. The window is epochs now, and the shim
+  parses bounds the way the daemon does, so a window built from intervals is red here and dead on a node, the same
+  fact. A marker from an earlier boot no longer anchors the window (it is a file, and it outlives the boot that wrote
+  it). Two rows a stop owes are now printed: a removal the worker's daemon refuses alerts with the container named, and
+  a worker config naming no `STATE_DIR` says so instead of reading rank 1 as a plain absence. The fixture's shared
+  `world.json` reads take its lock, which is the root of the canary test's 1-in-5 red.
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
   occurrence of an image, so an agent history that resends the same screenshot released it early; the next request
   with that image raised `KeyError` inside rank 0's prefill forward, rank 1 waited in the exchange, and both ranks
