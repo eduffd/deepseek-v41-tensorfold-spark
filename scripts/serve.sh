@@ -219,7 +219,10 @@ epoch_of() { # a docker timestamp as an epoch: docker events' .Time answers epoc
 boot_start_epoch() { # when this boot began: an exit record's epoch is compared with it to tell this boot's deaths
     awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0
 }
-mark_stopped() { mkdir -p "$STATE_DIR" && echo "$(boot_id) $(date +%s)" > "$STATE_DIR/stopped"; }
+mark_stopped() { # the pair is stopped by a human, from this second on. Stamped a second ahead of the clock at the
+    # write, and every call site writes it just after a force kill: epochs are whole seconds, so a marker landing in
+    # the kills' own second cannot be told from a marker written before them, and two readers place witnesses on it.
+    mkdir -p "$STATE_DIR" && echo "$(boot_id) $(( $(date +%s) + 1 ))" > "$STATE_DIR/stopped"; }
 clear_stopped() { rm -f "$STATE_DIR/stopped" 2>/dev/null || true; }
 
 run_canary() { # 0: passed (or off)
@@ -355,7 +358,7 @@ cmd_heal() { # everything the operator reads after a heal, and the state the nex
     else
         log "lease: ${WATCH_LEASE:-unset}"
     fi
-    if flock -n "$STATE_DIR/lock" true; then log "lock: free"; else log "lock: held (a start or a heal runs now)"; fi
+    if flock -n "$STATE_DIR/lock" true; then log "lock: free"; else log "lock: held (a start, a heal or a stop is running)"; fi
     log "witness r0: $(pair_exit 0)"
     log "witness r1: $(pair_exit 1)"
     log "stop marker: $(cat "$STATE_DIR/stopped" 2>/dev/null || echo none)"
@@ -405,11 +408,14 @@ witness_class() { # $1 code $2 epoch $3 boot: exit 70 on this boot, newer than t
 }
 
 classify() { # one merge site, reading watch_tick's locals: sets bad (the verdict) and cls (definitive | debounced |
-    # standdown, with stand as its line). Empty bad with no cls = healthy.
+    # standdown, with stand as its line). Empty bad with no cls = healthy. The comparison against the stop marker is
+    # inclusive at the marker's own second: epochs are whole seconds, mark_stopped stamps one second after the stop's
+    # kills, and a rank that dies a beat behind its peer (rank 1 following rank 0's removal) leaves its witness in
+    # exactly that second. A start clears the marker, so a marker found here is this stop's.
     bad=""; cls=""; stand=""
     if [[ "$r0" == absent && "$r1" == absent ]]; then
         if [[ -n "$mb" && "$mb" != "$cb" ]]; then bad="both ranks absent after a reboot (stopped before it: $STATE_DIR/stopped)"; cls=debounced
-        elif [[ -n "$mb" && "$mt" -gt "${t0:-0}" && "$mt" -gt "${t1:-0}" ]]; then cls=standdown; stand="both ranks absent (stopped on purpose); standing down"
+        elif [[ -n "$mb" && "$mt" -ge "${t0:-0}" && "$mt" -ge "${t1:-0}" ]]; then cls=standdown; stand="both ranks absent (stopped on purpose); standing down"
         elif [[ "$b0" == "$cb" || "$b1" == "$cb" ]]; then
             bad="both ranks absent, exit witnesses from this boot (r0 ${c0:-none} r1 ${c1:-none})"
             [[ "$c0" == 70 || "$c1" == 70 ]] && bad="$bad (fail-fast exit 70)"
@@ -516,7 +522,7 @@ cache_mount() { # $1 = head|worker: fills MOUNT with the -v that fills that node
 
 mount_words() { # the same mount for a command string that another shell reparses (`bash -c`, ssh): quoted as one
     # word per argument, so a path with a space stays one path.
-    cache_mount "$1"; printf '%q' "${MOUNT[0]} ${MOUNT[1]}"
+    cache_mount "$1"; printf '%q %q' "${MOUNT[@]}"
 }
 
 cmd_prebuild() { # both nodes: the CUDA extensions into CACHE_VOL with nothing else in memory (a build beside the

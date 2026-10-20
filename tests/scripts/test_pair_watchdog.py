@@ -42,7 +42,7 @@ class TestStalledVerdict(ShellCase):
         self.rig.container(r0); self.rig.container(r1)
         self.rig.health("503", STALLED_BODY)
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: /health 503" in line for line in lines),
@@ -63,7 +63,7 @@ class TestIncidentRepro(ShellCase):
         self.rig.exit_record(0, "70", time.time() - 60)
         self.rig.exit_record(1, "70", time.time() - 60)
 
-        proc = self.rig.tick("zig", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("zig", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1:" in line and "(fail-fast exit 70)" in line for line in lines),
@@ -107,7 +107,7 @@ class TestHeal(ShellCase):
         self.rig.container(r1, running="false", status="exited", exit_code="70", finished_age_s=60)
         self.rig.log_line(r0, "[tensorfold] serving: 4 slot(s) x 300000 tokens; health strict")
 
-        proc = self.rig.tick("python", WATCH_HEAL="1")
+        proc = self.rig.tick_writing_config("python", WATCH_HEAL="1")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 1: rank 0 false (fail-fast exit 70)" in line for line in lines),
@@ -129,7 +129,7 @@ class TestStandDowns(ShellCase):
         self.rig.state_file("fails", "2")
         lease = self.rig.lease()
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
 
         self.assertEqual(self.rig.stdout_lines(proc), [f"[dsv41-tf] watch: {lease} is fresh; standing down"])
         self.assertEqual(self.rig.state_file("fails"), "0", "standing down clears the bad-tick streak")
@@ -141,7 +141,7 @@ class TestStandDowns(ShellCase):
         r0, r1 = self.rig.py_names()
         self.rig.absent(r0, r1)
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
 
         self.assertEqual(self.rig.stdout_lines(proc), [PY_DOWN_NEVER], f"{proc.stdout}{proc.stderr}")
         self.assertEqual(self.rig.state_file("fails"), "0", "standing down clears the bad-tick streak")
@@ -157,7 +157,7 @@ class TestDefinitiveAndDebounced(ShellCase):
         self.rig.container(r1, running="false", status="exited", exit_code="1", finished_age_s=300)
         self.rig.state_file("last_heal", str(int(time.time()) - 100))
 
-        proc = self.rig.tick("python")
+        proc = self.rig.tick_writing_config("python")
         lines = self.rig.stdout_lines(proc)
 
         self.assertTrue(any("watch: bad tick 1 of 3: rank 0 false" in line for line in lines),
@@ -240,7 +240,7 @@ class TestPythonRecipeIdentity(ShellCase):
             with self.subTest(state=state):
                 rig = self.new_rig()
                 setup(rig)
-                proc = rig.tick("python")
+                proc = rig.tick_writing_config("python")
                 want_lines, want_fails, want_rc = expect(rig)
 
                 self.assertEqual(rig.stdout_lines(proc), want_lines, f"{state} ({proc.stderr})")
