@@ -4,6 +4,7 @@ const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
 const pace_mod = @import("pace.zig");
+const stall_mod = @import("stall.zig");
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -76,6 +77,9 @@ pub const LaneHost = struct {
     closing: bool = false,
     /// the rounds' pace against their baseline, read by /health (under the mutex)
     pace: pace_mod.Pace = .{},
+    /// the stall watch `startStall` installed; never copied after start
+    watch: ?stall_mod.Watch = null,
+    round_no: u64 = 0, // engine thread only
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
     halt_reason: ?[]const u8 = null,
     thread: ?std.Thread = null,
@@ -148,7 +152,24 @@ pub const LaneHost = struct {
     }
 
     pub fn start(h: *LaneHost) !void {
+        errdefer h.stopStall();
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+    }
+
+    /// Installs the stall watch before `start` spawns the engine.
+    pub fn startStall(h: *LaneHost, settings: stall_mod.Settings, exit_fn: *const fn (u8) void, sink: stall_mod.Sink) !void {
+        if (!settings.on()) return;
+        h.watch = stall_mod.Watch.init(h.io, settings);
+        const w = &h.watch.?;
+        w.exit_fn = exit_fn;
+        w.sink = sink;
+        try w.start();
+    }
+
+    /// Stops and joins the watch; idempotent.
+    pub fn stopStall(h: *LaneHost) void {
+        if (h.watch) |*w| w.close();
+        h.watch = null;
     }
 
     /// Stops admitting, cancels what is left and joins the engine thread (after `halt`: the thread is gone already).
@@ -159,6 +180,7 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
         if (h.thread) |t| t.join();
         h.thread = null;
+        h.stopStall();
         h.queued.deinit(h.gpa);
         h.admitted.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
@@ -177,6 +199,7 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
         if (h.thread) |t| t.join();
         h.thread = null;
+        h.stopStall();
     }
 
     pub fn engine(h: *LaneHost) Engine {
@@ -391,11 +414,15 @@ pub const LaneHost = struct {
             return false;
         }
         const job = h.queued.orderedRemove(0);
+        h.round_no += 1;
+        if (h.watch) |*w| w.begin(h.round_no, .admit);
+        defer if (h.watch) |*w| w.end();
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
             return true;
         };
+        if (h.watch) |*w| w.counts(@intCast(h.admitted.items.len), @intCast(h.queued.items.len));
         h.unlock();
         if (!h.openStream(job)) return true;
         const began = job.began;
@@ -456,6 +483,9 @@ pub const LaneHost = struct {
 
     /// One round under the family's planner; false when it did nothing (nothing to admit, prefill or decode).
     fn round(h: *LaneHost, rd: Rounds) bool {
+        h.round_no += 1;
+        if (h.watch) |*w| w.begin(h.round_no, .admit);
+        defer if (h.watch) |*w| w.end();
         var did = false;
         // the admission pass, decided whole before any of it runs
         var admits: std.ArrayList(*Job) = .empty;
@@ -490,6 +520,7 @@ pub const LaneHost = struct {
                 }
             }
         }
+        if (h.watch) |*w| w.counts(@intCast(h.admitted.items.len), @intCast(h.queued.items.len));
         h.unlock();
         for (refused.items) |x| h.finish(x.job, .failed, x.why);
         rd.vtable.admitted(rd.ctx) catch |e| {
@@ -507,10 +538,13 @@ pub const LaneHost = struct {
             rd.vtable.began(rd.ctx, @intFromPtr(job), b.damaged);
         }
         // this round's pieces, a decode round of the streams decoding, then the prompts whose rows are in
+        if (h.watch) |*w| w.phase(.plan);
         rd.vtable.plan(rd.ctx, &h.pieces, &h.finals) catch |e| {
             h.failAll(h.words(e));
             return true;
         };
+        if (h.watch) |*w| w.plan(@intCast(h.pieces.items.len), @intCast(h.finals.items.len));
+        if (h.watch) |*w| w.phase(.pieces);
         const t0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
         if (h.core.cfg.piece_runs and h.core.backend.vtable.pieces != null) {
             // one call for the round's pieces (the backend runs several slots' rows in one forward); a failure fails each
@@ -548,11 +582,13 @@ pub const LaneHost = struct {
         const join = h.core.cfg.join_tail;
         if (join and h.finals.items.len > 0) {
             did = true;
+            if (h.watch) |*w| w.phase(.finals);
             h.runFinals();
         }
         var step_ns: i96 = 0;
         if (h.core.activeCount() > 0) {
             did = true;
+            if (h.watch) |*w| w.phase(.decode);
             const s0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));
@@ -562,9 +598,11 @@ pub const LaneHost = struct {
         }
         if (!join and h.finals.items.len > 0) {
             did = true;
+            if (h.watch) |*w| w.phase(.finals);
             h.runFinals();
         }
         const t2 = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (h.watch) |*w| w.phase(.deliver);
         var i: usize = 0;
         while (i < h.admitted.items.len) {
             const job = h.admitted.items[i];
@@ -574,6 +612,7 @@ pub const LaneHost = struct {
                 h.unlock();
             } else i += 1;
         }
+        if (h.watch) |*w| w.phase(.after);
         rd.vtable.after(rd.ctx, seconds(t1 - t0), seconds(t2 - t1));
         if (did) {
             var rows: u64 = 0;
@@ -792,6 +831,9 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
+            h.round_no += 1;
+            if (h.watch) |*w| w.begin(h.round_no, .decode);
+            defer if (h.watch) |*w| w.end();
             const s0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));
@@ -801,6 +843,7 @@ pub const LaneHost = struct {
             h.lock();
             h.pace.round(s1, 0, 0, seconds(s1 - s0));
             h.unlock();
+            if (h.watch) |*w| w.phase(.deliver);
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
@@ -992,5 +1035,6 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 test {
     _ = @import("lane_host_test.zig");
     _ = @import("lane_host_resume_test.zig");
+    _ = @import("lane_host_stall_test.zig");
     _ = @import("pace.zig");
 }
