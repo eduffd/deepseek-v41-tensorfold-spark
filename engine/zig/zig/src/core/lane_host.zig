@@ -1015,5 +1015,6 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
 test {
     _ = @import("lane_host_test.zig");
     _ = @import("lane_host_resume_test.zig");
+    _ = @import("lane_host_stall_test.zig");
     _ = @import("pace.zig");
 }
