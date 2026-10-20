@@ -19,28 +19,43 @@
 # Configuration: config/prod.env (cp config/prod.env.example config/prod.env; CONFIG=path for another). A non-empty
 # caller export of a config key wins over the file, e.g. a test server next to nothing else:
 #   PORT=8001 NAME=dsv41-tf-test MASTER_PORT=29561 scripts/serve.sh start
+# Recipe: RECIPE (config key, default python) picks scripts/serve/$RECIPE.sh, sourced after the config; it answers
+# five calls (pair_required_keys, pair_exit <rank>, pair_launch <rank>, pair_stop <grace_s>, pair_boot_decision).
+# python = config/prod.env today; zig = the pair scripts/run-zig.sh launches (its adapter names its own keys).
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 CONFIG="${CONFIG:-config/prod.env}"
 [[ -f "$CONFIG" ]] || { echo "[dsv41-tf] no config file $CONFIG (cp config/prod.env.example config/prod.env and fill it in)" >&2; exit 2; }
 export CONFIG
-caller_env=$(env | grep -E '^(CONTEXT|PARALLEL|IMAGE|PORT|HOST|NAME|SERVED_NAME|ALIASES|MAX_TOKENS|KV_DTYPE|MASTER_PORT|CANARY|DROP_CACHES|MEM_GATE_[A-Z]+|READY_TIMEOUT|PREFLIGHT|HEAD_STATE|WORKER_STATE|HEAD_PREPARED|WORKER_PREPARED|CACHE_VOL|STATE_DIR|LOG_MAX_[A-Z]+|WATCH_[A-Z_]+|OUT|TF_DSV41_[A-Z0-9_]+|GLM53_TF_[A-Z0-9_]+|(MI)?MALLOC_[A-Z_]+)=.' || true)
+caller_env=$(env | grep -E '^(CONTEXT|PARALLEL|IMAGE|PORT|HOST|NAME|SERVED_NAME|ALIASES|MAX_TOKENS|KV_DTYPE|MASTER_PORT|CANARY|DROP_CACHES|MEM_GATE_[A-Z]+|READY_TIMEOUT|PREFLIGHT|HEAD_STATE|WORKER_STATE|HEAD_PREPARED|WORKER_PREPARED|CACHE_VOL|STATE_DIR|LOG_MAX_[A-Z]+|RECIPE|BOOT_[A-Z_]+|WATCH_[A-Z_]+|OUT|TF_DSV41_[A-Z0-9_]+|GLM53_TF_[A-Z0-9_]+|(MI)?MALLOC_[A-Z_]+)=.' || true)
 set -a
 # shellcheck disable=SC1090
 source "$CONFIG"
 set +a
 while IFS= read -r kv; do [[ -n "$kv" ]] && export "${kv?}"; done <<< "$caller_env"
-for _k in WORKER_SSH HEAD_IP NCCL_SOCKET_IFNAME NCCL_IB_HCA HEAD_MODEL WORKER_MODEL HEAD_ENGRAM WORKER_ENGRAM \
-          HEAD_STATE WORKER_STATE HEAD_PREPARED WORKER_PREPARED IMAGE; do
-    if [[ -z "${!_k:-}" || "${!_k}" == *"<"*">"* ]]; then echo "[dsv41-tf] $CONFIG: set $_k" >&2; exit 2; fi
-done
-
-NAME="${NAME:-dsv41-tf}"
+# The config boundary: the recipe, its adapter file, the pair's addresses, then the recipe's own key check. The ports,
+# the head address and the slot-line regex are keys / derived values here, not adapter calls: the Zig profile names
+# them TF_TP_PORT and TF_TP_MASTER, so each takes the other's value when its own is unset.
+RECIPE="${RECIPE:-python}"
+case "$RECIPE" in
+    python|zig) ;;
+    *) echo "[dsv41-tf] $CONFIG: RECIPE=$RECIPE: use python or zig" >&2; exit 2 ;;
+esac
+adapter="scripts/serve/$RECIPE.sh"
+[[ -f "$adapter" ]] || { echo "[dsv41-tf] $CONFIG: no adapter for RECIPE=$RECIPE (write $adapter)" >&2; exit 2; }
+NAME="${NAME:-dsv41-tf}"                            # containers $NAME-r0 (head) / $NAME-r1 (worker), both recipes
 PORT="${PORT:-8000}"
+MASTER_PORT="${MASTER_PORT:-${TF_TP_PORT:-29571}}"; TF_TP_PORT="${TF_TP_PORT:-$MASTER_PORT}"
+HEAD_IP="${HEAD_IP:-${TF_TP_MASTER:-}}"
+SLOT_LINE_RE="${SLOT_LINE_RE:-serving: [0-9]+ slot\(s\)}"
+ROCE_STATE="${ROCE_STATE:-/sys/class/infiniband}"
+# shellcheck disable=SC1090
+source "$adapter"
+pair_required_keys
+
 HOST="${HOST:-127.0.0.1}"
 BASE="http://127.0.0.1:$PORT"
 PARALLEL="${PARALLEL:-4}"
-MASTER_PORT="${MASTER_PORT:-29571}"
 CACHE_VOL="${CACHE_VOL:-dsv41-tf-cache}"
 CANARY="${CANARY:-strict}"
 DROP_CACHES="${DROP_CACHES:-1}"
@@ -55,35 +70,23 @@ log() { echo "[dsv41-tf] $*"; }
 wssh() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$WORKER_SSH" "$@"; }
 on_node() { local n=$1; shift; if [[ "$n" == head ]]; then bash -c "$*"; else wssh "$*"; fi; }
 
-container_args() { # $1 = rank: `docker run` options of that rank's container (no image, no command)
-    local rank=$1 model engram prep state a
-    if [[ "$rank" == 0 ]]; then model=$HEAD_MODEL engram=$HEAD_ENGRAM prep=$HEAD_PREPARED state=$HEAD_STATE
-    else model=$WORKER_MODEL engram=$WORKER_ENGRAM prep=$WORKER_PREPARED state=$WORKER_STATE; fi
-    a="--gpus all --ipc=host --network host --device /dev/infiniband --ulimit memlock=-1"
-    a+=" --cap-add IPC_LOCK --log-opt max-size=$LOG_MAX_SIZE --log-opt max-file=$LOG_MAX_FILE"
-    a+=" -v $model:/model:ro -v $engram:/engram:ro -v $prep:/prepared"
-    a+=" -v $state:/state -v $state/sessions:/sessions -v $CACHE_VOL:/cache -e PYTHONDONTWRITEBYTECODE=1"
-    a+=" -e TORCH_EXTENSIONS_DIR=/cache/torch_extensions -e TRITON_CACHE_DIR=/cache/triton"
-    a+=" -e CUDA_CACHE_PATH=/cache/nv/ComputeCache -e TF_DSV41_IMAGE_ID=${IMAGE_ID:-$IMAGE}"
-    a+=" -e TF_DSV41_LAUNCH_T0=$(date +%s.%N)"
-    a+=" $(env | grep -E '^(TF_DSV41_[A-Z0-9_]+|GLM53_TF_[A-Z0-9_]+|(MI)?MALLOC_[A-Z_]+)=' | grep -vE '^TF_DSV41_(LAUNCH_T0|IMAGE_ID)=' | sort | sed 's/^/-e /' | tr '\n' ' ')"
-    a+=" -e NCCL_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME -e NCCL_IB_HCA=$NCCL_IB_HCA -e GLOO_SOCKET_IFNAME=$NCCL_SOCKET_IFNAME"
-    # GB10: NCCL's cuMem allocations exhausted the driver's pool at boot (NV_ERR_NO_MEMORY), failing later starts
-    a+=" -e NCCL_CUMEM_HOST_ENABLE=${NCCL_CUMEM_HOST_ENABLE:-0} -e NCCL_CUMEM_ENABLE=${NCCL_CUMEM_ENABLE:-0}"
-    echo "$a"
+roce_cmd() { # the RoCE leg as one command string, so the head and the worker run the same test (printf keeps $d for
+    # the node's own shell): every NCCL_IB_HCA device's port 1 must read ACTIVE
+    printf 'for d in %s; do grep -q ACTIVE %s/$d/ports/1/state || exit 1; done' "${NCCL_IB_HCA//,/ }" "$ROCE_STATE"
 }
 
-run_args() { # $1 = rank: `docker run` arguments of that rank's server container (`python -m tensorfold serve`)
-    local rank=$1 a
-    a="--name $NAME-r$rank -d $(container_args "$rank")"
-    a+=" --entrypoint python $IMAGE -m tensorfold serve /model --tp 2 --rank $rank --master $HEAD_IP"
-    a+=" --master-port $MASTER_PORT --context ${CONTEXT:-300000} --parallel $PARALLEL --kv-dtype ${KV_DTYPE:-fp8}"
-    a+=" --no-update-check"
-    if [[ "$rank" == 0 ]]; then
-        a+=" --host $HOST --port $PORT${SERVED_NAME:+ --name $SERVED_NAME}${MAX_TOKENS:+ --max-tokens $MAX_TOKENS}"
-        local al; for al in ${ALIASES:-}; do a+=" --alias $al"; done
-    fi
-    echo "$a"
+nodes_ready() { # both nodes usable for the pair: docker here, docker on the worker over ssh, RoCE ACTIVE on both.
+    # $1 = seconds to keep trying (0: one look). This is the repo's one readiness gate: preflight, boot-start.sh and
+    # every heal run through it, so the RoCE test lives in exactly one place.
+    local end
+    end=$(( $(date +%s) + ${1:-0} ))
+    while :; do
+        if docker info >/dev/null 2>&1 && wssh "docker info >/dev/null 2>&1 && $(roce_cmd)" >/dev/null 2>&1 && bash -c "$(roce_cmd)"; then
+            return 0
+        fi
+        (( $(date +%s) < end )) || { log "nodes not ready: docker on this node, docker over ssh ($WORKER_SSH), RoCE ACTIVE (${NCCL_IB_HCA//,/ })"; return 1; }
+        sleep 3
+    done
 }
 
 gpu_busy() { # a CUDA process on either node: another workload is still up
@@ -134,7 +137,7 @@ mem_gate() { # MemFree (not MemAvailable: unified memory) >= MEM_GATE_GIB on bot
 check_slots() { # rank 0's `[tensorfold] serving: N slot(s) x ...` line (deepseek_v41 stack.py) must show PARALLEL
     local n="" _i
     for _i in $(seq 1 60); do
-        n=$(docker logs "$NAME-r0" 2>&1 | grep -oE 'serving: [0-9]+ slot\(s\)' | tail -1 | grep -oE '[0-9]+' || true)
+        n=$(docker logs "$NAME-r0" 2>&1 | grep -oE "$SLOT_LINE_RE" | tail -1 | grep -oE '[0-9]+' | tail -1 || true)
         [[ -n "$n" ]] && break; sleep 1
     done
     if [[ -z "$n" ]]; then log "no 'serving: N slot(s)' line from rank 0 within 60 s"; return 3; fi
@@ -153,7 +156,7 @@ wimage_key() { wssh "docker image inspect -f '$IMAGE_KEY_FMT' '$1' 2>/dev/null |
 
 preflight() { # read-only checks of both nodes; non-zero on a problem. $1 = static: skip ports / GPU / RoCE marker
     local bad=0 node f h w
-    wssh true || { log "preflight: cannot ssh to $WORKER_SSH"; return 1; }
+    nodes_ready || { log "preflight: the readiness gate failed (docker, ssh, RoCE)"; return 1; }
     h=$(docker image inspect -f '{{.Id}}' "$IMAGE" >/dev/null 2>&1 && image_key "$IMAGE" || true)
     w=$(wssh docker image inspect "$IMAGE" >/dev/null 2>&1 && wimage_key "$IMAGE" || true)
     [[ -n "$h" ]] || { log "preflight: no image $IMAGE here (scripts/serve.sh build)"; bad=1; }
@@ -171,10 +174,6 @@ preflight() { # read-only checks of both nodes; non-zero on a problem. $1 = stat
         done
         on_node "$node" "ls -d '$prep'/*/*/rank$rank >/dev/null 2>&1" \
             || log "preflight: warning: no prepared rank$rank folder under $prep on the $node (the first start writes ~95 GB, slow)"
-        for f in ${NCCL_IB_HCA//,/ }; do
-            local st; st=$(on_node "$node" "cat /sys/class/infiniband/$f/ports/1/state" 2>/dev/null || echo "")
-            [[ "$st" == *ACTIVE* ]] || { log "preflight: $f port 1 on the $node is '${st:-unreadable}'"; bad=1; }
-        done
     done
     if [[ "${1:-}" == static ]]; then return $bad; fi    # static: what can be checked while something else serves
     listening "$PORT" && { log "preflight: something listens on :$PORT already (the other stack?)"; bad=1; }
@@ -185,15 +184,10 @@ preflight() { # read-only checks of both nodes; non-zero on a problem. $1 = stat
     return $bad
 }
 
-stop_both() {
-    docker rm -f "$NAME-r0" >/dev/null 2>&1 &
-    local p0=$!
-    wssh docker rm -f "$NAME-r1" >/dev/null 2>&1 &
-    local p1=$!
-    wait "$p0" || true; wait "$p1" || true
-}
-
 boot_id() { echo "${WATCH_BOOT_ID:-$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || echo unknown)}"; }
+boot_start_epoch() { # when this boot began: an exit record's epoch is compared with it to tell this boot's deaths
+    awk -v n="$(date +%s)" '{printf "%d", n - $1}' /proc/uptime 2>/dev/null || echo 0
+}
 mark_stopped() { mkdir -p "$STATE_DIR" && echo "$(boot_id) $(date +%s)" > "$STATE_DIR/stopped"; }
 clear_stopped() { rm -f "$STATE_DIR/stopped" 2>/dev/null || true; }
 
@@ -205,16 +199,13 @@ run_canary() { # 0: passed (or off)
 }
 
 start_once() { # 0 ready; 1 failed; 2 canary failed; 3 short of slots
-    stop_both
+    pair_stop 0
     drop_caches
     mem_gate || return 1
     IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || echo "$IMAGE")
-    # shellcheck disable=SC2046
-    wssh "mkdir -p '$WORKER_STATE/sessions' && docker run $(run_args 1)" >/dev/null &
+    pair_launch 1 >/dev/null &            # rank 1 over ssh, overlapping rank 0's start as it always has
     local wpid=$!
-    mkdir -p "$HEAD_STATE/sessions"
-    # shellcheck disable=SC2046
-    docker run $(run_args 0) >/dev/null
+    pair_launch 0 >/dev/null
     wait "$wpid" || { log "rank 1 did not start"; return 1; }
     log "waiting for rank 0 on :$PORT"
     local t0
@@ -259,59 +250,102 @@ cmd_start() {
         2) log "canary failed: stopping both ranks (logs in $STATE_DIR)"; mkdir -p "$STATE_DIR"
            docker logs --tail 200 "$NAME-r0" > "$STATE_DIR/canary-fail-r0.log" 2>&1 || true
            wssh docker logs --tail 200 "$NAME-r1" > "$STATE_DIR/canary-fail-r1.log" 2>&1 || true
-           stop_both; exit 1 ;;
+           pair_stop 0; exit 1 ;;
         3) log "short of request slots twice: leaving it up for 'logs'; stop / restart after dropping caches"; exit 3 ;;
         *) log "start failed; 'logs' to inspect, 'stop' removes the containers"; exit 1 ;;
     esac
 }
 
 # -- watchdog ---------------------------------------------------------------------------------------------------------------
-# Stands down while a start runs (lock), when both containers are absent after a deliberate `stop` during THIS boot,
-# while rank 0 is younger than WATCH_GRACE, and while WATCH_LEASE (optional: a file you touch while you benchmark or
-# maintain the pair) is younger than WATCH_LEASE_MIN minutes. A tick is bad when a rank exited or /health fails;
-# WATCH_FAILS bad ticks in a row heal (WATCH_HEAL=1: restart in the background) at most once every WATCH_MIN_HEAL s.
-# A rank that exited with code 70 is the engine's fail-fast (TF_DSV41_FAILFAST: a failure on either rank ends both in
-# ~1 s): the pair is known dead and consistent, so it heals on the first tick, at most once every WATCH_FF_MIN_HEAL s.
-# "Both absent" after a reboot heals (a `stop` before the reboot does not survive it; boot-start.sh starts first).
+# Stands down while a start runs (lock) and while WATCH_LEASE (optional: a file you touch while you benchmark or
+# maintain the pair) is younger than WATCH_LEASE_MIN minutes. classify is the tick's one merge site: it reads both
+# ranks' presence, the recipe's exit witnesses (pair_exit: "<code> <epoch> <boot_id>", empty when there is none) and
+# the stop marker, and answers the verdict with its class.
+#   definitive — the engine's own words, so no debounce: a fail-fast exit 70 (TF_DSV41_FAILFAST: a failure on either
+#     rank ends both in ~1 s) witnessed on this boot and newer than the last heal, a pair death witnessed on this
+#     boot, and a /health body labelled by the engine ("status":"stalled" with a stall_reason, "ok":false with
+#     "fatal"). Heals on the FIRST tick, at most once every WATCH_FF_MIN_HEAL s.
+#   debounced — the actor's own client observations: a plain non-200, 000 past WATCH_GRACE, a rank gone with no
+#     witness. WATCH_FAILS bad ticks in a row heal (WATCH_HEAL=1: restart in the background) at most once every
+#     WATCH_MIN_HEAL s.
+# The stop marker owns the human teardown, and only that: it stands the tick down when nothing died after it (newer
+# than both witnesses); a marker from an earlier boot is bad (a `stop` before a reboot does not survive it;
+# boot-start.sh starts first); both ranks absent with no witness and no marker means the pair never started on this
+# node. No threshold in the actor is a stall threshold: the 503 labels and the 70 are the engine's, re-derived here.
 WATCH_GRACE="${WATCH_GRACE:-1800}"; WATCH_FAILS="${WATCH_FAILS:-3}"; WATCH_HEAL="${WATCH_HEAL:-0}"
 WATCH_MIN_HEAL="${WATCH_MIN_HEAL:-1800}"; WATCH_FF_MIN_HEAL="${WATCH_FF_MIN_HEAL:-120}"; WATCH_ALERT="${WATCH_ALERT:-}"
 WATCH_LEASE="${WATCH_LEASE:-}"; WATCH_LEASE_MIN="${WATCH_LEASE_MIN:-20}"
 lease_fresh() { [[ -n "$WATCH_LEASE" && -f "$WATCH_LEASE" ]] && (( $(date +%s) - $(stat -c %Y "$WATCH_LEASE") < WATCH_LEASE_MIN * 60 )); }
-stopped_before_reboot() { local b; read -r b _ < "$STATE_DIR/stopped" 2>/dev/null || return 1; [[ -n "$b" && "$b" != "$(boot_id)" ]]; }
 alert() { log "ALERT: $*"; [[ -z "$WATCH_ALERT" ]] || "$WATCH_ALERT" "$*" || true; }
+STALLED_RE='"status"[[:space:]]*:[[:space:]]*"stalled"'
+FATAL_RE='"ok"[[:space:]]*:[[:space:]]*false'
+
+witness_class() { # $1 code $2 epoch $3 boot: exit 70 on this boot, newer than the last heal, is the engine reporting
+    # a dead-and-consistent pair; every other code is the actor reading what a container left behind.
+    [[ "$1" == 70 && "$3" == "$(boot_id)" && "${2:-0}" -gt "$last" ]] && { echo definitive; return; }
+    echo debounced
+}
+
+classify() { # one merge site, reading watch_tick's locals: sets bad (the verdict) and cls (definitive | debounced |
+    # standdown, with stand as its line). Empty bad with no cls = healthy.
+    bad=""; cls=""; stand=""
+    if [[ "$r0" == absent && "$r1" == absent ]]; then
+        if [[ -n "$mb" && "$mb" != "$cb" ]]; then bad="both ranks absent after a reboot (stopped before it: $STATE_DIR/stopped)"; cls=debounced
+        elif [[ -n "$mb" && "$mt" -gt "${t0:-0}" && "$mt" -gt "${t1:-0}" ]]; then cls=standdown; stand="both ranks absent (stopped on purpose); standing down"
+        elif [[ "$b0" == "$cb" || "$b1" == "$cb" ]]; then
+            bad="both ranks absent, exit witnesses from this boot (r0 ${c0:-none} r1 ${c1:-none})"
+            [[ "$c0" == 70 || "$c1" == 70 ]] && bad="$bad (fail-fast exit 70)"
+            cls=definitive
+        elif [[ -z "$c0" && -z "$c1" && -z "$mb" ]]; then cls=standdown; stand="both ranks absent with no exit witness and no stop marker (never started on this node); standing down"
+        else bad="both ranks absent, exit witnesses from an earlier boot (r0 ${c0:-none} r1 ${c1:-none})"; cls=debounced
+        fi
+        return 0
+    fi
+    if [[ "$r0" != true ]]; then
+        bad="rank 0 $r0"; cls=$(witness_class "$c0" "$t0" "$b0")
+        [[ "$cls" == definitive ]] && bad="$bad (fail-fast exit 70)"
+        return 0
+    fi
+    if [[ "$r1" == unreachable ]]; then cls=standdown; stand="worker unreachable over ssh (not counted)"; return 0; fi
+    if [[ "$r1" != true ]]; then
+        bad="rank 1 $r1"; cls=$(witness_class "$c1" "$t1" "$b1")
+        [[ "$cls" == definitive ]] && bad="$bad (fail-fast exit 70)"
+        return 0
+    fi
+    age=$(( now - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$NAME-r0")" +%s) ))
+    body=$(curl -s -m 10 -w '\n%{http_code}' "$BASE/health" || true)
+    code=${body##*$'\n'}; body=${body%$'\n'*}
+    if [[ "$code" == 200 ]]; then return 0; fi
+    if [[ "$code" == 000 && $age -lt $WATCH_GRACE ]]; then cls=standdown; stand="loading (${age}s)"; return 0; fi
+    bad="/health $code ${body:0:300}"
+    cls=debounced
+    [[ "$body" =~ $STALLED_RE && "$body" == *stall_reason* ]] && cls=definitive
+    [[ "$body" =~ $FATAL_RE && "$body" == *fatal* ]] && cls=definitive
+    return 0
+}
 
 watch_tick() {
     mkdir -p "$STATE_DIR"
-    local fails_f="$STATE_DIR/fails" heal_f="$STATE_DIR/last_heal" fails r0 r1 age code body now bad="" last
-    fails=$(cat "$fails_f" 2>/dev/null || echo 0); now=$(date +%s)
+    local fails_f="$STATE_DIR/fails" heal_f="$STATE_DIR/last_heal" fails r0 r1 age code body now last bad cls stand
+    local e0 e1 c0 t0 b0 c1 t1 b1 mb mt cb need min
+    fails=$(cat "$fails_f" 2>/dev/null || echo 0); now=$(date +%s); last=$(cat "$heal_f" 2>/dev/null || echo 0)
     if lease_fresh; then echo 0 > "$fails_f"; log "watch: $WATCH_LEASE is fresh; standing down"; return 0; fi
     if ! flock -n "$STATE_DIR/lock" true; then log "watch: a start is in progress; standing down"; return 0; fi
     r0=$(running 0); r1=$(running 1)
-    if [[ "$r0" == absent && "$r1" == absent ]]; then
-        if ! stopped_before_reboot; then echo 0 > "$fails_f"; log "watch: both ranks absent (stopped on purpose); standing down"; return 0; fi
-        bad="both ranks absent after a reboot (stopped before it: $STATE_DIR/stopped)"
-    elif [[ "$r0" != true ]]; then bad="rank 0 $r0"
-    elif [[ "$r1" == unreachable ]]; then log "watch: worker unreachable over ssh (not counted)"
-    elif [[ "$r1" != true ]]; then bad="rank 1 $r1"
-    else
-        age=$(( now - $(date -d "$(docker inspect -f '{{.State.StartedAt}}' "$NAME-r0")" +%s) ))
-        body=$(curl -s -m 10 -w '\n%{http_code}' "$BASE/health" || true)
-        code=${body##*$'\n'}; body=${body%$'\n'*}
-        if [[ "$code" == 200 ]]; then :
-        elif [[ "$code" == 000 && $age -lt $WATCH_GRACE ]]; then log "watch: loading (${age}s)"; echo 0 > "$fails_f"; return 0
-        else bad="/health $code ${body:0:300}"; fi
-    fi
+    c0=""; t0=0; b0=""; c1=""; t1=0; b1=""; mb=""; mt=0        # a missing witness or marker leaves these at "none"
+    e0=$(pair_exit 0); e1=$(pair_exit 1)
+    read -r c0 t0 b0 <<< "${e0:-}"
+    read -r c1 t1 b1 <<< "${e1:-}"
+    read -r mb mt <<< "$(cat "$STATE_DIR/stopped" 2>/dev/null || true)"; mt="${mt:-0}"
+    cb=$(boot_id)
+    classify
+    if [[ "$cls" == standdown ]]; then echo 0 > "$fails_f"; log "watch: $stand"; return 0; fi
     if [[ -z "$bad" ]]; then echo 0 > "$fails_f"; return 0; fi
-    local need=$WATCH_FAILS min=$WATCH_MIN_HEAL e0 e1
-    e0=$(docker inspect -f '{{.State.ExitCode}}' "$NAME-r0" 2>/dev/null || true)
-    e1=$(wssh docker inspect -f "'{{.State.ExitCode}}'" "$NAME-r1" 2>/dev/null || true)
-    if [[ "$r0" == false && "$e0" == 70 ]] || [[ "$r1" == false && "$e1" == 70 ]]; then
-        need=1; min=$WATCH_FF_MIN_HEAL; bad="$bad (fail-fast exit 70)"
-    fi
+    need=$WATCH_FAILS; min=$WATCH_MIN_HEAL
+    [[ "$cls" == definitive ]] && { need=1; min=$WATCH_FF_MIN_HEAL; }
     fails=$((fails + 1)); echo "$fails" > "$fails_f"
     log "watch: bad tick $fails of $need: $bad"
     (( fails >= need )) || return 0
-    last=$(cat "$heal_f" 2>/dev/null || echo 0)
     if [[ "$WATCH_HEAL" != 1 ]]; then alert "unhealthy ($bad); WATCH_HEAL=0, not restarting"; return 1; fi
     if (( now - last < min )); then alert "unhealthy ($bad); healed $((now - last))s ago, waiting"; return 1; fi
     echo "$now" > "$heal_f"; echo 0 > "$fails_f"
@@ -393,14 +427,16 @@ cmd_run() { # MODULE [ARGS...]: an engine module on both ranks (rank 1 on the wo
     return "$rc0"
 }
 
+if [[ "${SERVE_LIB:-0}" == 1 ]]; then return 0; fi     # sourced as a library (scripts/boot-start.sh): functions only
 case "${1:-}" in
 build) cmd_build ;;
 prebuild) cmd_prebuild ;;
 cache) cache_files ;;
-run) shift; cmd_run "$@" ;;
+run) [[ "$RECIPE" == python ]] || { log "run: the engine-module runner belongs to the python recipe"; exit 2; }
+     shift; cmd_run "$@" ;;
 start) cmd_start ;;
-restart) take_lock; stop_both; log "stopped"; cmd_start ;;
-stop) stop_both; mark_stopped; log "stopped (stop marker: $STATE_DIR/stopped)" ;;
+restart) take_lock; pair_stop 0; log "stopped"; cmd_start ;;
+stop) pair_stop 0; mark_stopped; log "stopped (stop marker: $STATE_DIR/stopped)" ;;
 status)
     docker ps -a --filter "name=^$NAME-r" --format '{{.Names}} {{.Status}}'
     wssh "docker ps -a --filter name=^$NAME-r --format '{{.Names}} {{.Status}}'" || true
@@ -412,6 +448,6 @@ preflight) preflight "${2:-}" && log "preflight ok${2:+ ($2)}" ;;
 watch)
     if [[ "${2:-}" == --once ]]; then watch_tick; exit $?; fi
     while :; do watch_tick || true; sleep "${WATCH_INTERVAL:-60}"; done ;;
-args) IMAGE_ID="${IMAGE_ID:-$IMAGE}" run_args "${2:-0}"; echo ;;
+args) IMAGE_ID="${IMAGE_ID:-$IMAGE}" pair_args "${2:-0}"; echo ;;
 *) sed -n '2,18p' "$0"; exit 2 ;;
 esac
