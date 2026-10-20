@@ -49,6 +49,9 @@ pub const Settings = struct {
     stall_round_s: f64 = 120,
     /// TF_DSV41_STALL_SLOW_S / GLM53_TF_STALL_SLOW_S: /health 503 when the rounds' pace has been slow this long
     stall_slow_s: f64 = 180,
+    /// TF_DSV41_STALL_EXIT_S / GLM53_TF_STALL_EXIT_S: seconds the /health stall label must hold before the engine
+    /// fails fast (exit 70, which the pair watchdog heals). 0: off (a wedge then runs to the watchdog).
+    stall_exit_s: f64 = 0,
 
     /// The knobs from ``env``; ``problem`` names a bad one.
     pub fn fromEnv(env: ?*const std.process.Environ.Map, problem: *[]const u8) error{Invalid}!Settings {
@@ -66,6 +69,7 @@ pub const Settings = struct {
         if (knob(m, "STALL_S")) |v| s.stall_s = try nonNegative(v, 0, problem, "GLM53_TF_STALL_S: must be a number >= 0");
         if (knob(m, "STALL_ROUND_S")) |v| s.stall_round_s = try nonNegative(v, 120, problem, "TF_DSV41_STALL_ROUND_S / GLM53_TF_STALL_ROUND_S: seconds, a number >= 0");
         if (knob(m, "STALL_SLOW_S")) |v| s.stall_slow_s = try nonNegative(v, 180, problem, "TF_DSV41_STALL_SLOW_S / GLM53_TF_STALL_SLOW_S: seconds, a number >= 0");
+        if (knob(m, "STALL_EXIT_S")) |v| s.stall_exit_s = try nonNegative(v, 0, problem, "TF_DSV41_STALL_EXIT_S / GLM53_TF_STALL_EXIT_S: seconds, a number >= 0 (0: off)");
         if (knob(m, "SSE_KEEPALIVE_S")) |v| s.keepalive_s = try nonNegative(v, 15, problem, "TF_DSV41_SSE_KEEPALIVE_S / GLM53_TF_SSE_KEEPALIVE_S: seconds, a number >= 0");
         if (knob(m, "DRAIN_S")) |v| s.drain_s = try nonNegative(v, 20, problem, "TF_DSV41_DRAIN_S / GLM53_TF_DRAIN_S: seconds, a number >= 0");
         if (m.get("GLM53_TF_STALL_PREFILL_TPS")) |v| s.stall_prefill_tps = try nonNegative(v, 200, problem, "GLM53_TF_STALL_PREFILL_TPS: must be a number >= 0");
@@ -109,6 +113,29 @@ pub const Settings = struct {
         return x;
     }
 };
+
+/// The stall verdict `/health` labels 503 on: work in flight and no round ended for `stall_round_s`.
+pub fn roundStalled(stall_round_s: f64, busy: bool, age: ?f64) bool {
+    if (stall_round_s <= 0) return false;
+    const a = age orelse return false;
+    return busy and a > stall_round_s;
+}
+
+/// When the stall verdict first held (monotonic ns; null: it holds from this tick). The clock runs only while it
+/// holds, so a round completing clears it.
+pub const StallClock = struct { crossed_ns: ?i96 = null };
+
+/// One tick of the self-exit (TF_DSV41_STALL_EXIT_S): the stall verdict plus how long it has held. `exit_s <= 0`
+/// is the knob off, and no tick fires; the first tick only starts the clock. A pair with nothing in flight never
+/// holds the verdict, so an idle pair never fires.
+pub fn stallTick(stall_round_s: f64, exit_s: f64, busy: bool, age: ?f64, now_ns: i96, clock: StallClock) struct { fire: bool, crossed_ns: ?i96 } {
+    if (exit_s <= 0 or !roundStalled(stall_round_s, busy, age)) return .{ .fire = false, .crossed_ns = null };
+    const crossed = clock.crossed_ns orelse return .{ .fire = false, .crossed_ns = now_ns };
+    return .{ .fire = @as(f64, @floatFromInt(now_ns - crossed)) >= exit_s * std.time.ns_per_s, .crossed_ns = crossed };
+}
+
+/// The stall self-exit's target: the engine's own fail-fast (the peers hear it on the fate channel, exit 70).
+pub const ExitRequest = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, reason: []const u8) void };
 
 /// Python's ``round(x, n)`` (correctly rounded through the decimal text).
 pub fn round(x: f64, comptime n: u8) f64 {
@@ -165,6 +192,7 @@ pub const Health = struct {
     prefill_tps: f64,
     stall_round_s: f64,
     stall_slow_s: f64,
+    stall_exit_s: f64,
     started: i96,
     mutex: std.Io.Mutex = .init,
     fatal: ?[]u8 = null,
@@ -182,7 +210,7 @@ pub const Health = struct {
     pub const End = union(enum) { ok: Outcome, failed: struct { value_error: bool, message: []const u8 } };
 
     pub fn init(gpa: Allocator, io: std.Io, s: Settings) Health {
-        return .{ .gpa = gpa, .io = io, .mode = s.health, .stall_s = s.stall_s, .prefill_tps = s.stall_prefill_tps, .stall_round_s = s.stall_round_s, .stall_slow_s = s.stall_slow_s, .started = now(io) };
+        return .{ .gpa = gpa, .io = io, .mode = s.health, .stall_s = s.stall_s, .prefill_tps = s.stall_prefill_tps, .stall_round_s = s.stall_round_s, .stall_slow_s = s.stall_slow_s, .stall_exit_s = s.stall_exit_s, .started = now(io) };
     }
 
     pub fn deinit(h: *Health) void {
@@ -279,11 +307,38 @@ pub const Health = struct {
     pub fn stuck(h: *const Health, a: Allocator, st: api.Status, inflight: usize) Allocator.Error!?[]const u8 {
         const p = st.pace orelse return null;
         const busy = inflight > 0 or st.running > 0 or st.waiting > 0;
-        if (busy and h.stall_round_s > 0) if (p.last_round_age_s) |age| if (age > h.stall_round_s)
-            return try std.fmt.allocPrint(a, "no round for {d:.0} s with work in flight", .{age});
+        if (roundStalled(h.stall_round_s, busy, p.last_round_age_s))
+            return try std.fmt.allocPrint(a, "no round for {d:.0} s with work in flight", .{p.last_round_age_s.?});
         if (h.stall_slow_s > 0 and p.slow_s > h.stall_slow_s)
             return try std.fmt.allocPrint(a, "rounds slower than their baseline for {d:.0} s (decode {d:.3} s vs {d:.3}; prefill {d:.0} vs {d:.0} rows/s)", .{ p.slow_s, p.decode_s, p.decode_base_s, p.prefill_rows_s, p.prefill_base_rows_s });
         return null;
+    }
+
+    /// rank 0's stall self-exit (TF_DSV41_STALL_EXIT_S): one poll a second of what ``/health`` already computes (the
+    /// pace's last-round age and the in-flight count); past ``stall_exit_s`` of the stall verdict holding it prints
+    /// its witness and runs ``exit`` (the engine's fail-fast: exit 70, which the pair watchdog heals). A wedge ends
+    /// by itself instead of running until a human stops the pair; ``stop`` (the server's own stop) keeps a drain
+    /// unwedged, and an idle pair never holds the verdict.
+    pub fn stallExitLoop(h: *Health, engine: api.Engine, exit: ExitRequest, stop: *const std.atomic.Value(bool)) void {
+        var clock: StallClock = .{};
+        while (!stop.load(.acquire)) {
+            std.Io.sleep(h.io, .fromMilliseconds(1000), .awake) catch {};
+            if (stop.load(.acquire)) break; // the sleep began before the stop: the verdict is stale
+            var st: api.Status = .{};
+            engine.status(&st, &.{});
+            const age: ?f64 = if (st.pace) |p| p.last_round_age_s else null;
+            h.mutex.lockUncancelable(h.io);
+            const inflight = h.inflight.count();
+            h.mutex.unlock(h.io);
+            const busy = inflight > 0 or st.running > 0 or st.waiting > 0;
+            const v = stallTick(h.stall_round_s, h.stall_exit_s, busy, age, now(h.io), clock);
+            clock = .{ .crossed_ns = v.crossed_ns };
+            if (!v.fire) continue;
+            const why: []const u8 = std.fmt.allocPrint(h.gpa, "no round for {d:.0} s with {d} in flight (TF_DSV41_STALL_ROUND_S {d:.0}, TF_DSV41_STALL_EXIT_S {d:.0})", .{ age orelse 0, inflight, h.stall_round_s, h.stall_exit_s }) catch "no round completed with work in flight";
+            std.log.scoped(.stall).warn("{s}: failing fast so every rank restarts", .{why});
+            exit.run(exit.ctx, why);
+            return;
+        }
     }
 
     /// ``GET /health``: the status code and body. ``streams``: the engine's slots (null: not a batch engine).
@@ -762,6 +817,61 @@ pub const RequestLog = struct {
         l.written = 0;
     }
 };
+
+test "the stall self-exit: the gauge's verdict plus a duration; idle and off never fire" {
+    const round_s: f64 = 120;
+    const exit_s: f64 = 180;
+    const s = std.time.ns_per_s;
+    // idle (nothing in flight) with a huge age: not stalled
+    var v = stallTick(round_s, exit_s, false, 1e6, 0, .{});
+    try std.testing.expect(!v.fire and v.crossed_ns == null);
+    // work in flight with the age under the label's limit: not stalled
+    v = stallTick(round_s, exit_s, true, 100, 0, .{});
+    try std.testing.expect(!v.fire and v.crossed_ns == null);
+    // the age over the limit at the first tick: the clock starts, the exit is later
+    v = stallTick(round_s, exit_s, true, 121, 10 * s, .{});
+    try std.testing.expect(!v.fire and v.crossed_ns.? == 10 * s);
+    const crossed = v.crossed_ns.?;
+    // held past the limit for under the window: no
+    v = stallTick(round_s, exit_s, true, 250, crossed + 179 * s, .{ .crossed_ns = crossed });
+    try std.testing.expect(!v.fire and v.crossed_ns.? == crossed);
+    // held for the window: fire
+    v = stallTick(round_s, exit_s, true, 301, crossed + 180 * s, .{ .crossed_ns = crossed });
+    try std.testing.expect(v.fire);
+    // a round completing resets: the age is back under the limit and the clock clears
+    v = stallTick(round_s, exit_s, true, 0.2, crossed + 181 * s, .{ .crossed_ns = crossed });
+    try std.testing.expect(!v.fire and v.crossed_ns == null);
+    // the knob off (0): nothing fires, whatever the age and the clock
+    v = stallTick(round_s, 0, true, 1e6, 10 * s, .{ .crossed_ns = 0 });
+    try std.testing.expect(!v.fire and v.crossed_ns == null);
+    // an engine with no completed round yet is not stalled: the gauge has no age to read
+    v = stallTick(round_s, exit_s, true, null, 10 * s, .{});
+    try std.testing.expect(!v.fire and v.crossed_ns == null);
+    // the verdict itself
+    try std.testing.expect(roundStalled(120, true, 121));
+    try std.testing.expect(!roundStalled(120, false, 1e6));
+    try std.testing.expect(!roundStalled(120, true, null));
+    try std.testing.expect(!roundStalled(0, true, 1e6));
+}
+
+test "TF_DSV41_STALL_EXIT_S: unset is off, 0 is off, GLM53_TF_ wins, a negative is refused" {
+    const gpa = std.testing.allocator;
+    var env = std.process.Environ.Map.init(gpa);
+    defer env.deinit();
+    var problem: []const u8 = "";
+    try std.testing.expectEqual(@as(f64, 0), (try Settings.fromEnv(&env, &problem)).stall_exit_s);
+    try env.put("TF_DSV41_STALL_EXIT_S", "180");
+    try std.testing.expectEqual(@as(f64, 180), (try Settings.fromEnv(&env, &problem)).stall_exit_s);
+    try env.put("GLM53_TF_STALL_EXIT_S", "300");
+    try std.testing.expectEqual(@as(f64, 300), (try Settings.fromEnv(&env, &problem)).stall_exit_s);
+    // GLM53_TF_ wins: its 0 turns the knob off over TF_DSV41_'s 180
+    try env.put("GLM53_TF_STALL_EXIT_S", "0");
+    try std.testing.expectEqual(@as(f64, 0), (try Settings.fromEnv(&env, &problem)).stall_exit_s);
+    // a negative is refused like its siblings, and the problem names the knob
+    try env.put("GLM53_TF_STALL_EXIT_S", "-5");
+    try std.testing.expectError(error.Invalid, Settings.fromEnv(&env, &problem));
+    try std.testing.expect(std.mem.indexOf(u8, problem, "STALL_EXIT_S") != null);
+}
 
 test "contextMessage is the Python server's" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

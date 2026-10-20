@@ -158,6 +158,9 @@ pub const Opened = struct {
     ctx: *anyopaque,
     /// A drain's deadline: rounds end at the next boundary, what is left fails with `reason`; null: `close` alone.
     halt: ?*const fn (ctx: *anyopaque, reason: []const u8) void = null,
+    /// The stall watchdog's exit (TF_DSV41_STALL_EXIT_S): this engine's fail-fast, `reason` naming the stall;
+    /// null: this engine has none (no peer to take down with it).
+    stall_exit: ?*const fn (ctx: *anyopaque, reason: []const u8) void = null,
 };
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0 };

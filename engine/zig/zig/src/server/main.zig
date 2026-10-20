@@ -80,6 +80,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer closer.closeOnce();
     return serve.run(gpa, io, args, .{
         .stop = .{ .ctx = &closer, .halt = if (opened.halt != null) Closer.halt else null, .close = Closer.close },
+        .stall = if (opened.stall_exit) |x| .{ .ctx = opened.ctx, .run = x } else null,
         .engine = opened.engine,
         .text = text,
         .family = fam,

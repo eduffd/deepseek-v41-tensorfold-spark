@@ -48,7 +48,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = try std.fmt.allocPrint(a, "the DeepSeek-V4.1 CUDA engine cannot load {s} ({s})", .{ o.dir, @errorName(e) });
         return null;
     };
-    return .{ .engine = s.engine(), .close = Served.close, .ctx = s, .halt = Served.halt };
+    return .{ .engine = s.engine(), .close = Served.close, .ctx = s, .halt = Served.halt, .stall_exit = Served.stallExit };
 }
 
 pub const Served = struct {
@@ -252,6 +252,13 @@ pub const Served = struct {
     pub fn halt(ctx: *anyopaque, reason: []const u8) void {
         const s: *Served = @ptrCast(@alignCast(ctx));
         s.host.halt(reason);
+    }
+
+    /// The stall watchdog's verdict (TF_DSV41_STALL_EXIT_S, server/serve.zig): this rank's own fail-fast, so the peer
+    /// is told on the fate channel and both ranks end with 70, which the pair watchdog heals.
+    pub fn stallExit(ctx: *anyopaque, reason: []const u8) void {
+        const s: *Served = @ptrCast(@alignCast(ctx));
+        s.m.session.fatal(reason, error.Stalled);
     }
 
     pub fn close(ctx: *anyopaque) void {

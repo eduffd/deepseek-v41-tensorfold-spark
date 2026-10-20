@@ -10,6 +10,7 @@ const listener_mod = @import("listener.zig");
 const model_text = @import("model_text.zig");
 const server_mod = @import("server.zig");
 const routes = @import("routes.zig");
+const spark = @import("spark.zig");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
@@ -90,6 +91,8 @@ pub const Setup = struct {
     wire: @import("spark.zig").Wire = .tensorfold,
     /// Run by `run` so the engine stops before the server is freed; null: the caller closes it after `run`.
     stop: ?EngineStop = null,
+    /// The engine's fail-fast for a stall the stall watchdog found (TF_DSV41_STALL_EXIT_S): both ranks end with 70.
+    stall: ?spark.ExitRequest = null,
 };
 
 /// `halt` (optional) ends the rounds at a boundary at the drain's deadline, so `close` never meets a running round.
@@ -199,10 +202,24 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     // the listener stays open through the drain: new requests get 503 + Retry-After, /health "draining"
     var accept_stop: std.atomic.Value(bool) = .init(false);
     const accept = std.Thread.spawn(.{}, server_mod.Server.serve, .{ srv, lis, &accept_stop }) catch return 1;
+    // TF_DSV41_STALL_EXIT_S: a wedged rank 0 ends the pair by itself (the gauge's verdict held for the knob's
+    // seconds, then the engine's fail-fast: exit 70, which the pair watchdog heals). The Spark surface's knob.
+    var stall_stop: std.atomic.Value(bool) = .init(false);
+    var stall_thread: ?std.Thread = null;
+    if (srv.health != null and spark_settings.stall_exit_s > 0) if (s.stall) |x| {
+        stall_thread = std.Thread.spawn(.{}, spark.Health.stallExitLoop, .{ srv.health.?, s.engine, x, &stall_stop }) catch null;
+        log.line("stall self-exit: TF_DSV41_STALL_EXIT_S={d} s, TF_DSV41_STALL_ROUND_S={d} s ({s})", .{
+            spark_settings.stall_exit_s,
+            spark_settings.stall_round_s,
+            if (stall_thread != null) "no round with work in flight ends both ranks with 70" else "its thread could not start: a wedge runs to the watchdog",
+        });
+    };
     while (!stop_requested.load(.acquire)) std.Io.sleep(io, .fromMilliseconds(50), .awake) catch {};
+    stall_stop.store(true, .release); // a stop's drain is not a wedge
     drain(srv, io, s.stop, spark_settings.drain_s);
     accept_stop.store(true, .release);
     accept.join();
+    if (stall_thread) |t| t.join();
     lis.close();
     if (drawing) ticker.finish();
     // the engine stops while nothing runs on it: no round meets a CUDA driver torn down by the exit
