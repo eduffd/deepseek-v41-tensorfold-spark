@@ -9,6 +9,7 @@ rank becomes visible to `docker ps` / `docker inspect`; a non-zero docker_run_rc
 dies immediately does. Writes take a lock: a launch runs rank 1 and rank 0 side by side.
 """
 
+import datetime
 import fcntl
 import json
 import os
@@ -55,6 +56,86 @@ FIELDS = (
 )
 
 
+FIELDS_OK = ("Status", "ID", "Type", "Action", "Actor", "Time", "TimeNano")
+
+
+def render(fmt, event):
+    """The template's values for one die event. `events.Message` answers Time, TimeNano and the Actor's attribute map;
+    the CLI validates the template before it prints, so a field it cannot resolve never reaches the output."""
+    def value(path):
+        parts = path.strip(".").split(".")
+        if parts == ["Time"]:
+            return str(event["time"])
+        if parts == ["TimeNano"]:
+            return str(event["time"] * 10**6)
+        if parts == ["Actor", "Attributes", "exitCode"]:
+            return event["code"]
+        if parts in (["Action"], ["Status"]):
+            return "die"
+        if parts == ["ID"]:
+            return event["name"]
+        return ""
+
+    return re.sub(r"\{\{(.*?)\}\}", lambda m: value(m.group(1)), fmt)
+
+
+def events_op(world, argv):
+    """docker events --format <tmpl> --filter event=die --filter container=<name> [--since X] [--until X].
+
+    The template is validated the way the CLI validates it: a leading `.Attributes` is not a field of
+    `events.Message` (the attributes hang off `.Actor`), and a bad template is exit 64 with no output. `--since` /
+    `--until` bound the window (a bare `<n>s` is relative to now, `0s` is now, an epoch or an RFC3339 stamp is
+    absolute), because the pair's witness chain anchors the die-event read to its own stop marker."""
+    fmt, fmtflag = argv[0], argv[1] == "1"
+    args = argv[2:]
+    if fmtflag:
+        for expr in re.findall(r"\{\{(.*?)\}\}", fmt):
+            parts = expr.strip().strip(".").split(".")
+            if not re.fullmatch(r"[\w.]+", expr.strip()) or not expr.strip().startswith("."):
+                sys.stderr.write(f"template parsing error: template: output:1: syntax error: {expr}\n")
+                return 64
+            if parts[0] not in FIELDS_OK:
+                sys.stderr.write(f'template parsing error: template: output:1:{len(expr)}: can\'t evaluate field '
+                                 f'{parts[0]} in type *events.Message\n')
+                return 64
+    since, until, want = None, None, []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--since", "--until"):
+            value = args[i + 1]
+            i += 2
+            if a == "--since":
+                since = value
+            else:
+                until = value
+            continue
+        if a.startswith("container="):
+            want.append(a[10:])
+        i += 1
+
+    def bound(value, default):
+        if value is None:
+            return default
+        if value.endswith("s") and value[:-1].isdigit():
+            return time.time() - int(value[:-1])
+        if value.isdigit():
+            return int(value)
+        try:
+            return int(datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return default
+
+    lo, hi = bound(since, 0), bound(until, time.time())
+    for n, ev in sorted((world.get("die_events") or {}).items()):
+        if want and n not in want:
+            continue
+        if not lo <= ev["time"] <= hi:
+            continue
+        print(render(fmt, {"name": n, **ev}) if fmtflag else f"{n} die {ev['time']} exit={ev['code']}")
+    return 0
+
+
 def main():
     op, path = sys.argv[1], sys.argv[2]
     world = load(path)
@@ -90,6 +171,7 @@ def main():
         args = sys.argv[3:]
         name = args[args.index("--name") + 1] if "--name" in args else ""
         rc = int(world.get("docker_run_rc", 0))
+        mutate(path, lambda d: d.setdefault("run_calls", []).append(" ".join(args)))
         print("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
         if rc:
             return rc
@@ -135,12 +217,10 @@ def main():
         return 0
 
     if op == "events":
-        # docker events --format '{{.Time}} {{.Attributes.exitCode}}' with --filter event=die --filter container=<name>
-        want = [f[10:] for f in sys.argv[4:] if f.startswith("container=")]
-        for n, ev in sorted((world.get("die_events") or {}).items()):
-            if want and n not in want:
-                continue
-            print(f"{ev['time']} {ev['code']}")
+        return events_op(world, sys.argv[3:])
+
+    if op == "boot_id":
+        print(world.get("worker_boot_id", ""))
         return 0
 
     if op == "ssh_rc":

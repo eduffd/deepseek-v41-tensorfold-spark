@@ -8,7 +8,7 @@ fmt=""; quiet=0; filters=(); pos=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f) if (( fmtflag )); then fmt="$2"; shift 2; else shift; fi ;;
-        --format) fmt="$2"; shift 2 ;;
+        --format) fmt="$2"; fmtflag=1; shift 2 ;;
         -q|--quiet) quiet=1; shift ;;
         -a|-i|-d) shift ;;
         --filter) filters+=("$2"); shift 2 ;;
@@ -30,6 +30,6 @@ info)    exec python3 -I "$SHIM_DIR/_world.py" info "$FIXTURE" ;;
 rm)      exec python3 -I "$SHIM_DIR/_world.py" rm "$FIXTURE" "${pos[@]}" ;;
 stop)    exec python3 -I "$SHIM_DIR/_world.py" stop "$FIXTURE" "${pos[@]}" ;;
 ps)      exec python3 -I "$SHIM_DIR/_world.py" ps "$FIXTURE" "$quiet" "${filters[@]}" ;;
-events)  exec python3 -I "$SHIM_DIR/_world.py" events "$FIXTURE" "${filters[@]}" ;;
+events)  exec python3 -I "$SHIM_DIR/_world.py" events "$FIXTURE" "$fmt" "$fmtflag" "${args[@]}" ;;
 *)       exit 0 ;;
 esac

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# cat stand-in for one path only: /proc/sys/kernel/random/boot_id. The pair's two nodes reboot independently and the
+# test fixture is one filesystem, so the worker's boot id has to answer as a value of its own (world.json names it).
+# A head-side read answers the real file, and fails the way cat fails where there is none, which is what drives
+# serve.sh's `|| echo unknown` fallback.
+if [[ "${1:-}" == /proc/sys/kernel/random/boot_id && "${NODE_ROLE:-}" == worker ]]; then
+    exec python3 -I "$SHIM_DIR/_world.py" boot_id "$FIXTURE"
+fi
+exec /bin/cat "$@"

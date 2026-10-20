@@ -231,7 +231,9 @@ class TestPythonRecipeIdentity(ShellCase):
                 "1", 1)),
             "rank0_exit1": (rank0_exit1, lambda r: (bad_tick("rank 0 false"), "1", 0)),
             "worker_unreachable": (worker_unreachable, lambda r: (
-                ["[dsv41-tf] watch: worker unreachable over ssh (not counted)"], "0", 0)),
+                ["[dsv41-tf] ALERT: worker unreachable over ssh: rank 1 unwatched, so a rank-1-only wedge heals "
+                 "from nothing",
+                 "[dsv41-tf] watch: worker unreachable over ssh (not counted)"], "0", 0)),
         }
 
         for state, (setup, expect) in table.items():
