@@ -21,11 +21,16 @@ ROOT = Path(__file__).resolve().parents[2]
 SHIM_DIR = Path(__file__).parent / "shims"
 SERVE_SH = ROOT / "scripts" / "serve.sh"
 RUN_ZIG_SH = ROOT / "scripts" / "run-zig.sh"
+EXAMPLE_ZIG = ROOT / "config" / "prod-zig.env.example"
 
 IMAGE_PY = "test-image:1"
 IMAGE_ZIG = "test-zig-image:1"
 
 HEALTH_OK = '{"ok":true,"rounds_total":383335,"inflight":0,"queued":0}'
+
+# rank 0's boot line, in the form engine/zig/zig/src/server/serve.zig prints it (serve.sh's slot check reads it).
+ZIG_SLOT_LINE = ("[tensorfold] serving: 4 slot(s) x 1048576 tokens; wire spark; health strict; "
+                 "request log /state/requests.jsonl; disconnect on")
 
 PY_KEYS = {
     "RECIPE": "python",
@@ -66,6 +71,7 @@ ZIG_KEYS = {
     "RECIPE": "zig",
     "NAME": "tensorfold-zig",
     "IMAGE": IMAGE_ZIG,
+    "WORKER_SSH": "worker@127.0.0.1",
     "TF_TP_MASTER": "10.1.0.1",
     "TF_TP_PORT": "29599",
     "TF_COMM_BACKEND": "roce",
@@ -130,11 +136,14 @@ class Rig:
         data = json.loads(json.dumps({
             "containers": {},
             "images": {IMAGE_PY: {"id": "sha256:img", "created": "2026-01-01T00:00:00.000000000Z",
-                                  "layers": "sha256:layera sha256:layerb"}},
-            "logs": {},
+                                  "layers": "sha256:layera sha256:layerb"},
+                       IMAGE_ZIG: {"id": "sha256:zigimg", "created": "2026-01-02T00:00:00.000000000Z",
+                                   "layers": "sha256:ziglayera sha256:ziglayerb"}},
+            "logs": {f"{ZIG_KEYS['NAME']}-r0": ZIG_SLOT_LINE},
+            "die_events": {},
             "http": {"/health": {"code": "200", "body": HEALTH_OK},
                      "/v1/models": {"code": "200", "body": '{"data":[{"id":"Test-Model"}]}'}},
-            "docker_run_rc": 0, "docker_info_rc": 0, "worker_docker_info_rc": 0, "ssh_rc": 0,
+            "docker_run_rc": 0, "docker_run_hold_s": 30, "docker_info_rc": 0, "worker_docker_info_rc": 0, "ssh_rc": 0,
         }))
         data.update(patch)
         self.world_path.write_text(json.dumps(data))
@@ -188,6 +197,27 @@ class Rig:
         data["docker_run_rc"] = rc
         self._write_world(data)
 
+    def run_hold_s(self, seconds: float) -> None:
+        """How long a launched rank's container stays up in the world before the shim's `docker run` returns."""
+        data = self.get_world()
+        data["docker_run_hold_s"] = seconds
+        self._write_world(data)
+
+    def die_event(self, name: str, code: str, age_s: float, dialect: str = "iso") -> None:
+        """The die event `docker events --filter event=die` answers for a container with no cooperating launcher.
+        dialect="iso" answers a timestamp string, dialect="epoch" the epoch seconds `{{.Time}}` prints."""
+        data = self.get_world()
+        when = time.time() - age_s
+        data.setdefault("die_events", {})[name] = {"code": code,
+                                                  "time": str(int(when)) if dialect == "epoch" else iso(when)}
+        self._write_world(data)
+
+    def completions(self, code: str, body: str) -> None:
+        """The /v1/chat/completions answer the watchdog's probe reads."""
+        data = self.get_world()
+        data["http"]["/v1/chat/completions"] = {"code": code, "body": body}
+        self._write_world(data)
+
     # -- the state dir the scripts share ------------------------------------------------------
 
     def state_file(self, name: str, content: str | None = None) -> str:
@@ -214,22 +244,100 @@ class Rig:
 
     # -- the config and the run -------------------------------------------------------------
 
+    # A fill beginning with "=" is a literal value; the rest are fixture paths, relative to the fixture root
+    # ("." is the root itself, which is where the worker's copy of the checkout sits).
+    EXAMPLE_FILL = {
+        "ZIG_COMMIT": "=deadbeef",
+        "IMAGE": f"={IMAGE_ZIG}",
+        "TF_TP_MASTER": "=10.1.0.1",
+        "NCCL_SOCKET_IFNAME": "=lo0",
+        "NCCL_IB_HCA": "=fakea,fakeb",
+        "WORKER_SSH": "=worker@127.0.0.1",
+        "MODEL_DIR": "model",
+        "ENGRAM_DIR": "engram",
+        "ASSETS_DIR": "assets",
+        "PREPARED_DIR": "prepared",
+        "CACHE_DIR": "cache",
+        "STATE_DIR": "state",
+        "WORKER_REPO": ".",
+        "WATCH_LEASE": "state/lease",
+        "BOOT_LEASE": "state/lease",
+    }
+
     def write_config(self, recipe: str = "python", **overrides) -> Path:
         keys = dict(PY_KEYS if recipe == "python" else ZIG_KEYS)
         keys["STATE_DIR"] = str(self.state)
         keys["ROCE_STATE"] = str(self.root / "roce")
         keys["WATCH_LEASE"] = str(self.state / "lease")
-        for node in ("head", "worker"):
-            for kind in ("model", "engram", "prepared", "state"):
-                keys[f"{node.upper()}_{kind.upper()}"] = str(self.root / node / kind)
+        if recipe == "python":
+            # The Python recipe's config names a head and a worker copy of every pair path. The Zig recipe names
+            # each node's paths in that node's own config, so a Zig config gets no head/worker keys at all: that is
+            # what the shipped config/prod-zig.env.example names, and the scripts must answer it.
+            for node in ("head", "worker"):
+                for kind in ("model", "engram", "prepared", "state"):
+                    keys[f"{node.upper()}_{kind.upper()}"] = str(self.root / node / kind)
         if recipe == "zig":
             keys.update({"MODEL_DIR": str(self.root / "model"), "ENGRAM_DIR": str(self.root / "engram"),
                          "ASSETS_DIR": str(self.root / "assets"), "PREPARED_DIR": str(self.root / "prepared"),
-                         "CACHE_DIR": str(self.root / "cache")})
+                         "CACHE_DIR": str(self.root / "cache"), "WORKER_REPO": str(self.root)})
         for key, value in overrides.items():
             keys[key] = str(value)
         self.config.write_text("".join(f"{key}={value}\n" for key, value in keys.items()))
+        if recipe == "zig":
+            # The worker's own checkout and config, so a head-side launch can `cd $WORKER_REPO &&
+            # scripts/run-zig.sh 1 --detached` exactly as it does on the nodes. The fixture keeps one state dir for
+            # both nodes, which is where rank 1's exit record and durable log land.
+            self.make_zig_dirs()
+            (self.root / "config").mkdir(exist_ok=True)
+            (self.root / "config" / "prod-zig.env").write_text(self.config.read_text())
+            if not (self.root / "scripts").exists():
+                (self.root / "scripts").symlink_to(ROOT / "scripts")
         return self.config
+
+    def write_example_config(self, **overrides) -> Path:
+        """config/prod-zig.env.example as shipped, every placeholder filled with a fixture path: what an operator
+        gets from `cp config/prod-zig.env.example config/prod-zig.env`. Only the test knobs (fixture ports, no
+        canary, no memory gate, short timeouts, the context the fixture's rope.bin covers) are added, so a script
+        that reads a key the example does not name fails here, not on a node."""
+        keys = {}
+        for raw in EXAMPLE_ZIG.read_text().splitlines():
+            line = raw.strip().removeprefix("export ")
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            value = value.split("#")[0].strip().strip('"')
+            if not value:
+                continue
+            if value.startswith("<"):
+                if key not in self.EXAMPLE_FILL:
+                    raise AssertionError(f"config/prod-zig.env.example names a new placeholder for {key}: "
+                                         f"name its fixture value in Rig.EXAMPLE_FILL")
+                rel = self.EXAMPLE_FILL[key]
+                value = rel[1:] if rel.startswith("=") else str(self.root if rel == "." else self.root / rel)
+            keys[key] = value
+        keys.update({"PORT": "8199", "CANARY": "off", "DROP_CACHES": "0", "MEM_GATE_GIB": "0",
+                     "READY_TIMEOUT": "15", "TF_DSV41_CONTEXT": "1024", "TF_DSV41_SLOTS": "4",
+                     "ROCE_STATE": str(self.root / "roce"), "WATCH_HEAL": "1",
+                     "WATCH_MIN_HEAL": "0", "WATCH_FF_MIN_HEAL": "0"})
+        keys.update({key: str(value) for key, value in overrides.items()})
+        self.config.write_text("".join(f"{key}={value}\n" for key, value in keys.items()))
+        self.make_zig_dirs()
+        self.make_pair_files()
+        (self.root / "config").mkdir(exist_ok=True)
+        (self.root / "config" / "prod-zig.env").write_text(self.config.read_text())
+        if not (self.root / "scripts").exists():
+            (self.root / "scripts").symlink_to(ROOT / "scripts")
+        return self.config
+
+    def make_pair_files(self) -> None:
+        """What preflight tests for on a node: the model's tokenizer files, this rank's Engram shards, and a
+        prepared rank folder. The fixture keeps one tree, so it carries both ranks' files."""
+        for name in ("config.json", "tokenizer.json", "tokenizer_config.json"):
+            (self.root / "model" / name).write_text("{}")
+        for rank in (0, 1):
+            for kind in ("l1", "l14"):
+                (self.root / "engram" / f"engram-{kind}-r{rank}of2.bin").write_bytes(b"\0")
+            (self.root / "prepared" / "fill" / "shape" / f"rank{rank}").mkdir(parents=True, exist_ok=True)
 
     def make_zig_dirs(self) -> None:
         """The folders and assets scripts/run-zig.sh checks before it launches a rank, with a rope.bin big enough."""
@@ -257,8 +365,11 @@ class Rig:
                               capture_output=True, text=True, timeout=timeout)
 
     def make_roce_active(self) -> None:
-        """The sysfs tree nodes_ready reads: every NCCL_IB_HCA device's port 1 ACTIVE, under ROCE_STATE."""
-        for dev in PY_KEYS["NCCL_IB_HCA"].split(","):
+        """The sysfs tree nodes_ready reads: every NCCL_IB_HCA device the config names, port 1 ACTIVE, under
+        ROCE_STATE. Read from the config, so the shipped example's device names work as well as the fixture's."""
+        line = [l for l in self.config.read_text().splitlines() if l.startswith("NCCL_IB_HCA=")]
+        devices = (line[-1].split("=", 1)[1] if line else PY_KEYS["NCCL_IB_HCA"]).split(",")
+        for dev in devices:
             port = self.root / "roce" / dev / "ports" / "1"
             port.mkdir(parents=True, exist_ok=True)
             (port / "state").write_text("0: ACTIVE\n")
@@ -275,6 +386,11 @@ class Rig:
 
     def zig_names(self) -> tuple[str, str]:
         return f"{ZIG_KEYS['NAME']}-r0", f"{ZIG_KEYS['NAME']}-r1"
+
+    def heal_dirs(self) -> list[Path]:
+        """The evidence folders a heal wrote: newest first, as `ls -1dt` orders them."""
+        dirs = sorted((p for p in self.state.glob("heal-*") if p.is_dir()), reverse=True)
+        return dirs
 
     def wait_for_state_file_containing(self, name: str, needle: str, timeout: float = 60.0) -> str:
         deadline = time.time() + timeout
