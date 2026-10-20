@@ -91,8 +91,14 @@ Serving safety, on by default (G16-G19):
 Host memory and stalls (G12; defaults in brackets):
 
 - `TF_DSV41_STALL_S` (300; 0 = off): a round that runs longer prints a stall report on both ranks (rank, round, phase,
-  the round's plan, the forward's waits, every thread's stack), again every 4x that. `TF_DSV41_STALL_EXIT_S` (0 =
-  never) exits the process after that long in one round.
+  the round's plan, the forward's waits, every thread's stack), again every 4x that. That printed report and
+  `TF_DSV41_STALL_EXIT_S` (0 = never, exit after that long in one round) exist in the vendor Python family only
+  (`stall.py`'s `Watch`). The Zig engine reads `TF_DSV41_STALL_S` for the `/health` `stalled[]` list (default 0), reads
+  `TF_DSV41_STALL_ROUND_S` (120) and `TF_DSV41_STALL_SLOW_S` (180) for the `/health` stall labels, and reads
+  `TF_DSV41_STALL_EXIT_S` nowhere. A wedged Zig round runs forever, so the pair's recovery is the watchdog's, not the
+  engine's (fork issue [eduffd/deepseek-v41-tensorfold-spark#1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1),
+  [KNOWN-ISSUES](KNOWN-ISSUES.md)). What the Zig pair does answer on its own is the fail-fast exit 70
+  (`TF_DSV41_FAILFAST`), and the watchdog heals that on its first tick.
 - `TF_DSV41_ENGRAM_WAIT_S` (300; 0 = none): deadline on an Engram read and on the Engram gate's worker.
 - `TF_DSV41_NUMPY_HUGEPAGE` (0): NumPy's huge-page request on its large buffers, off on the ranks.
 - `TF_DSV41_HOST_BUFFERS` (6): reused NumPy buffers for a prompt segment's Engram rows.
@@ -136,22 +142,64 @@ Host memory and stalls (G12; defaults in brackets):
 
 ## Watchdog and start at boot
 
-- `scripts/serve.sh watch --once` (the `dsv41-tf-watchdog.timer` tick, every minute): a tick is bad when a rank
-  exited or `/health` fails. `WATCH_FAILS` (3) bad ticks in a row restart both ranks in the background
-  (`WATCH_HEAL=1`), at most once every `WATCH_MIN_HEAL` s (1800). A rank that exited with code 70 (fail-fast) heals on
-  the first bad tick, at most once every `WATCH_FF_MIN_HEAL` s (120). It stands down while a start runs, while rank 0 is
-  younger than `WATCH_GRACE` (1800 s), after a deliberate `serve.sh stop` during the same boot, and while
-  `WATCH_LEASE` (an optional file you touch while benchmarking or maintaining the pair) is fresh. `WATCH_ALERT=<cmd>`
-  is called with a message on every alert.
-- `scripts/boot-start.sh` (the `dsv41-boot-start.service` oneshot): after a reboot, starts the service if it was
-  serving (or crashed) before, once docker, the worker and the RoCE ports are up; `BOOT_DRY_RUN=1` shows the
-  decision. The watchdog is the fallback.
-- Before benchmarks with `scripts/serve.sh run`, stop the server and the watchdog timer
-  (`systemctl --user stop dsv41-tf-watchdog.timer`), or set `WATCH_LEASE` and touch the file.
+The watchdog runs on the head, on one config at a time. `scripts/serve.sh watch --once` is the tick, and
+`scripts/systemd/dsv41-watchdog@<config-basename>.timer` runs it every minute, so
+`dsv41-watchdog@prod-zig.timer` ticks with `CONFIG=config/prod-zig.env`. The Python profile keeps the legacy `dsv41-tf-watchdog.timer` and
+`dsv41-boot-start.service` with `config/prod.env`, untouched. Each profile keeps its own `STATE_DIR`, so no lock, lease,
+counter, marker, log or heal folder is shared between them.
+
+- The tick is bad when a rank is gone, `/health` answers other than 200, or a probe gets no completion (below). `000`
+  while rank 0 is younger than `WATCH_GRACE` (1800 s) is loading, not bad.
+- The verdicts split in two. Definitive is the engine's own words: a fail-fast exit 70 witnessed on this boot, a pair
+  death witnessed on this boot, and a `/health` body the engine labelled (`"status":"stalled"` with a `stall_reason`,
+  `"ok":false` with `"fatal"`). Those heal on the first tick, at most once every `WATCH_FF_MIN_HEAL` (120 s). Debounced
+  is the actor's own client observation (a plain non-200, `000` past grace, a rank gone with no witness). `WATCH_FAILS`
+  (3) bad ticks in a row heal, at most once every `WATCH_MIN_HEAL` (1800 s), with `WATCH_HEAL=1`. No threshold in the
+  actor is a stall threshold. The engine's stall knobs are in the table above; the tick re-derives none of them.
+- The two recipes witness a rank's exit differently, and only the recipe knows which. The Python pair's containers
+  persist, so `docker inspect` answers their exit code and finish time. The Zig pair runs `docker run --rm`, so a rank
+  leaves no container to inspect. `scripts/run-zig.sh` writes `<code> <epoch> <boot_id>` to `$STATE_DIR/exit-r<rank>`
+  on every invocation, rank 1's record living on the worker's own `STATE_DIR`. When no record exists, which covers a
+  hand-run `docker run` and an earlyoom SIGKILL, the `die` event inside `WATCH_EXIT_LOOKBACK_S` (180 s) is the witness.
+  A witness from an earlier boot is an earlier boot's death, never this one's.
+- The tick stands down while a start runs (the lock), while rank 0 is loading (`WATCH_GRACE`), after a deliberate
+  `scripts/serve.sh stop` in the same boot (the stop marker), when both ranks are absent with no witness and no marker
+  (the pair never started on this node), and while `WATCH_LEASE` is fresh (`WATCH_LEASE_MIN` 20 min, re-touchable). The
+  marker owns the human teardown, and only that.
+- A heal counts. `WATCH_MAX_HEALS` (5) consecutive heals with no clean tick between them alert and stop healing
+  (`0` turns the cap off); a clean tick resets the count in `$STATE_DIR/heals`. A pair that keeps coming back wedged
+  needs a human look, not a sixth restart.
+- A heal captures before it stops. `capture_evidence` writes `$STATE_DIR/heal-<utc>/` with `verdict.txt` (the class,
+  the verdict line, both witnesses), `health.json`, both ranks' log tails, and `nvidia-smi` from both nodes, and keeps
+  the newest `WATCH_EVIDENCE_KEEP` (20) folders. The force stop that follows destroys the wedged pair's containers,
+  and the root cause of the 2026-10-19 wedge is open ([KNOWN-ISSUES](KNOWN-ISSUES.md)), so the folder is that evidence.
+- The idle probe (`WATCH_PROBE=1`) is one tiny greedy completion, asked only when a 200 `/health` body reports
+  `inflight` 0 and `queued` 0, at most every `WATCH_PROBE_EVERY_S` (120 s), waiting `WATCH_PROBE_S` (120 s) for the
+  answer. A timeout is one debounced bad tick. It exists for the state no engine signal reports, a wedged rank 1
+  beside an idle rank 0. Off by default.
+- `scripts/serve.sh heal` prints what to read after a heal: the last heal and its age, `fails`, the consecutive heal
+  count, the lease and lock state, both exit witnesses, the stop marker, the `heal.log` tail and both ranks' log tails.
+  `WATCH_ALERT=<cmd>` is called with the text of every alert.
+- `scripts/boot-start.sh` is the `dsv41-boot-start.service` oneshot, and
+  `dsv41-boot-start@<config-basename>.service` names a profile. After a reboot, it starts the service if it was serving
+  (or crashed) before, once docker, the worker and the RoCE ports are up. `BOOT_DRY_RUN=1` shows the decision.
+  It reads `STATE_DIR`, the stop marker and `BOOT_LEASE` from the config it is given. The watchdog is the fallback.
+- Before benchmarks with `scripts/serve.sh run`, stop the server and the timer
+  (`systemctl --user stop dsv41-watchdog@prod-zig.timer`), or touch `WATCH_LEASE`. Any launcher you run beside the
+  watchdog should touch the lease first: this pair's Mac-side launch and teardown scripts do, so a start or a stop is
+  not raced by the tick.
 
 ## Logs and state
 
 - `docker logs dsv41-tf-r0` / `scripts/serve.sh logs 1`; the `[boot]` lines time each start phase.
 - `HEAD_STATE` / `WORKER_STATE`: the request log (`requests.jsonl`) and the session NVMe tier (`sessions/`).
-- `STATE_DIR` (default `~/.local/state/dsv41-tf`): the start lock, watchdog counters, stop marker, heal and
-  boot-start logs, canary-failure logs.
+- `STATE_DIR` (default `~/.local/state/dsv41-tf`; each profile sets its own): the start lock, watchdog counters
+  (`fails`, `heals`, `last_heal`), the probe throttle stamp (`last_probe`), the stop marker, the lease, the heal and
+  boot-start logs, canary-failure logs, and one `heal-<utc>/` evidence folder per heal (newest `WATCH_EVIDENCE_KEEP`
+  kept).
+- On the Zig profile, each node's `STATE_DIR` also holds that rank's launcher files: `exit-r<rank>` (the exit witness,
+  one line `<code> <epoch> <boot_id>`, written on every `scripts/run-zig.sh` invocation), `run-zig-r<rank>.log` (the
+  durable rank log a `--detached` launch appends to, capped at the newest 8 launch sections) and
+  `supervisor-r<rank>.pid` (the pid of a `--detached` loop, which `scripts/serve.sh stop` ends: a stop that left the
+  loop alive would relaunch the rank it was asked to keep down). A `--rm` container has no `docker logs` after it
+  exits, so these are the rank's own record of its last boots.

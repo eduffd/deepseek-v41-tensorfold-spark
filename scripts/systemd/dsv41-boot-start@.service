@@ -1,0 +1,19 @@
+# Start the profile this unit names once at boot on the head: %i is the config basename without .env, so
+# dsv41-boot-start@prod-zig.service runs scripts/boot-start.sh with CONFIG=config/prod-zig.env and therefore reads that
+# profile's own STATE_DIR, stop marker and BOOT_LEASE. The watchdog timer stays the fallback.
+# Install as a user unit with linger on (docs/INSTALL.md step 5); WorkingDirectory must be this checkout.
+# TimeoutStartSec matches the legacy dsv41-boot-start.service: a boot start waits out the memory gate and READY_TIMEOUT
+# (900 s), so the watchdog's 300 s would kill a start that is going well.
+[Unit]
+Description=DeepSeek-V4.1 TensorFold start at boot for %i (fast path; the watchdog is the fallback)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/deepseek-v41-tensorfold-spark
+Environment=CONFIG=config/%i.env
+ExecStart=/usr/bin/env bash scripts/boot-start.sh
+TimeoutStartSec=1800
+KillMode=process
+
+[Install]
+WantedBy=default.target

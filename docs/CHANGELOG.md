@@ -5,6 +5,17 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
 
 ## Bugs fixed
 
+- **A Zig pair that dies or wedges now restarts itself** (this update, the head-side watchdog on the Zig profile).
+  `scripts/run-zig.sh` records `<code> <epoch> <boot_id>` in `$STATE_DIR/exit-r<rank>` on every invocation, so a
+  `docker run --rm` rank's fail-fast exit 70 is a witnessed death and heals on the watchdog's first tick, at most once
+  every `WATCH_FF_MIN_HEAL` (120 s). Add the measured 122 s warm relaunch and serving is back in about 2-3 minutes.
+  The 2026-10-19 wedge is the before. No actor watched it, and it ran ~80 minutes to a human stop and start. A heal
+  captures the wedged pair into `$STATE_DIR/heal-<utc>/` before the force stop destroys its
+  containers, `WATCH_MAX_HEALS` (5) stops the healing of a pair that keeps coming back wedged, `scripts/serve.sh heal`
+  prints the witnesses and the log tails, and the tick probes a pair whose `/health` body reports itself idle, the
+  state a wedged rank 1 leaves rank 0 reporting. Units, knobs and stand-downs are in
+  [OPERATIONS](OPERATIONS.md) ("Watchdog and start at boot") and [ZIG-SERVE](ZIG-SERVE.md) ("Keep it supervised"); the
+  wedge's root cause stays open in [KNOWN-ISSUES](KNOWN-ISSUES.md).
 - **A duplicate image in one request killed both ranks** (G16). The vision row store counted a reference per
   occurrence of an image, so an agent history that resends the same screenshot released it early; the next request
   with that image raised `KeyError` inside rank 0's prefill forward, rank 1 waited in the exchange, and both ranks

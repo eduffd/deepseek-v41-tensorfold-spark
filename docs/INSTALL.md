@@ -99,6 +99,18 @@ loginctl enable-linger "$USER"
 systemctl --user daemon-reload && systemctl --user enable --now dsv41-tf-watchdog.timer && systemctl --user enable dsv41-boot-start.service
 ```
 
+The templated units take the config basename in place of `%i`, so the Zig profile (step 1's
+`config/prod-zig.env.example`) runs its own tick and its own boot start:
+
+```bash
+systemctl --user enable --now dsv41-watchdog@prod-zig.timer && systemctl --user enable dsv41-boot-start@prod-zig.service
+```
+
+The two families do not overlap: `dsv41-tf-watchdog.*` and `dsv41-boot-start.service` read
+`config/prod.env`, and `dsv41-watchdog@<profile>.*` / `dsv41-boot-start@<profile>.service` read
+`config/<profile>.env`. Arm one family per pair on a node. [`docs/OPERATIONS.md`](OPERATIONS.md) covers what each tick
+does, including the stand-down lease and the heal cap.
+
 `scripts/serve.sh` drops the page cache on both nodes around a start (`DROP_CACHES=1`: needs `sudo -n` or root for
 `/proc/sys/vm/drop_caches`; otherwise it logs and continues). [`docs/OPERATIONS.md`](OPERATIONS.md) covers the
 knobs, the memory gates, the watchdog, and how to turn each lever off.

@@ -1,0 +1,21 @@
+# One watchdog tick for the profile this unit names: %i is the config basename without .env, so
+# dsv41-watchdog@prod-zig.timer runs scripts/serve.sh watch --once with CONFIG=config/prod-zig.env. Install one instance
+# per profile on the head, with linger on (docs/INSTALL.md step 5). Healing: WATCH_HEAL / WATCH_FAILS / WATCH_MAX_HEALS
+# in that config. Stand the tick down while you benchmark or maintain the pair by touching its WATCH_LEASE file, or
+# stop this instance's timer (systemctl --user stop dsv41-watchdog@<profile>.timer).
+# The legacy dsv41-tf-watchdog.service / .timer (config/prod.env) stay as they are.
+[Unit]
+Description=DeepSeek-V4.1 TensorFold watchdog tick (%i)
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/deepseek-v41-tensorfold-spark
+Environment=CONFIG=config/%i.env
+# Environment=WATCH_ALERT=%h/bin/notify
+ExecStart=/usr/bin/env bash scripts/serve.sh watch --once
+# an unhealthy tick is logged, not a unit failure that trips start limits
+SuccessExitStatus=1
+# the heal runs `serve.sh restart` detached (setsid ... &): keep it alive when the oneshot exits
+KillMode=process
+TimeoutStartSec=300

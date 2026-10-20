@@ -140,6 +140,44 @@ was not repeated for this publication; the exported host build and host tests ar
 
    Check that the answer is 391; do not infer readiness from a live container alone.
 
+## Keep it supervised
+
+The launcher in a terminal is the human's shape: one container, and its exit code when it ends. Unattended serving
+uses `scripts/run-zig.sh N --detached`, which is what the watchdog launches. It re-runs the rank when the container ends
+with a code that is neither 0 nor 70, and it appends each launch section to `$STATE_DIR/run-zig-r<rank>.log`, keeping
+the newest 8 sections. Both shapes write the exit witness `<code> <epoch> <boot_id>` to `$STATE_DIR/exit-r<rank>` on
+every invocation, because a `--rm` rank leaves no container for `docker inspect`. Rank 1's witness and rank 1's log live
+on the worker's own `STATE_DIR`, which the head reads over ssh. Both shapes refuse to start a rank whose container
+already exists, and name the stop to run first.
+
+The production watchdog is the head-side tick, not the launcher. Arm it per profile with the templated units (see
+[INSTALL](INSTALL.md) step 5):
+
+```bash
+systemctl --user enable --now dsv41-watchdog@prod-zig.timer      # one tick a minute, healing after it
+systemctl --user enable dsv41-boot-start@prod-zig.service        # the start-at-boot fast path
+```
+
+`config/prod-zig.env.example` carries the supervision block: `RECIPE=zig`, `NAME`, `WORKER_SSH`, `WORKER_REPO`, the
+`WATCH_*` knobs, `WATCH_LEASE` and the boot lease. Append it to the config on the head. The engine knobs stay the
+engine's, and the block sets none of them.
+
+Read it with the recipe verbs, all of them safe to run at any moment:
+
+```bash
+scripts/serve.sh status            # both ranks' container state, /v1/models, /health
+scripts/serve.sh heal              # last heal and its age, lease, lock, both witnesses, the log tails
+scripts/serve.sh logs [0|1]        # docker logs of a live rank; serve.sh heal prints the launcher log tails
+scripts/serve.sh watch --once      # one tick by hand, the same one the timer runs
+```
+
+A heal writes `$STATE_DIR/heal.log` and captures the wedged pair into `$STATE_DIR/heal-<utc>/` before it stops the
+pair, since the force stop destroys the containers: verdict, `/health` body, both ranks' log tails, `nvidia-smi` from
+both nodes. `WATCH_MAX_HEALS` (5) stops the healing of a pair that keeps coming back wedged. Touch the `WATCH_LEASE` path the
+config names to stand the tick down while you benchmark or maintain the pair; this pair's Mac-side launch and teardown
+scripts touch it for you. [`docs/OPERATIONS.md`](OPERATIONS.md) covers every knob, the
+stand-downs, and the heal cap.
+
 ## Generate runtime assets
 
 Prepare the already-public Python reference source from the recipe root. Use a GPU-capable ARM64 environment
