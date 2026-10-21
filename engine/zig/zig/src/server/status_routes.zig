@@ -28,6 +28,37 @@ fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!vo
         }
         try o.put(a, "graphs", .{ .object = g });
     }
+    // a peer's transport facts, never a verdict: a half-wedge is a 200 with a growing frozen_s. The peer
+    // object is keyed only when the engine wires a peer and it has reported (fail-fast off shows none).
+    if (st.peer) |pp| {
+        const x = try json.newObject(a);
+        try x.put(a, "age_s", .{ .float = spark.round(pp.age_s, 1) });
+        try x.put(a, "frozen_s", .{ .float = spark.round(pp.frozen_s, 1) });
+        try x.put(a, "transport", .{ .string = @tagName(pp.transport) });
+        try x.put(a, "plans", try json.intValue(a, pp.plans));
+        try x.put(a, "doorbell", try json.intValue(a, pp.doorbell));
+        try x.put(a, "completed", try json.intValue(a, pp.completed));
+        try x.put(a, "proxy_seq", try json.intValue(a, pp.proxy_seq));
+        try x.put(a, "gaps", try json.intValue(a, pp.gaps));
+        try x.put(a, "bad", try json.intValue(a, pp.bad));
+        try x.put(a, "frames_sent", try json.intValue(a, pp.frames_sent));
+        try x.put(a, "frames_received", try json.intValue(a, pp.frames_received));
+        try x.put(a, "outstanding", try json.intValue(a, pp.outstanding));
+        try x.put(a, "since_lockstep_s", if (pp.since_lockstep_s) |v| .{ .float = spark.round(v, 1) } else .null);
+        if (pp.faulted) {
+            try x.put(a, "fault_seq", try json.intValue(a, pp.fault_seq));
+            try x.put(a, "fault_why", .{ .string = @tagName(pp.fault_why) });
+            try x.put(a, "waited_us", try json.intValue(a, pp.waited_us));
+        }
+        try x.put(a, "proxy_failed", .{ .bool = pp.proxy_failed });
+        try x.put(a, "aborted", .{ .bool = pp.aborted });
+        try x.put(a, "link_idle", .{ .bool = pp.link_idle });
+        const flags = try a.alloc(Value, 2);
+        flags[0] = try json.intValue(a, pp.peer_flags[0]);
+        flags[1] = try json.intValue(a, pp.peer_flags[1]);
+        try x.put(a, "flags", .{ .array = flags });
+        try o.put(a, "peer", .{ .object = x });
+    }
     const p = st.pace orelse return;
     const x = try json.newObject(a);
     try x.put(a, "last_age_s", if (p.last_round_age_s) |v| .{ .float = spark.round(v, 1) } else .null);
