@@ -378,8 +378,9 @@ pub const Health = struct {
         };
     }
 
-    /// ``GET /metrics``: Prometheus text, one ``model`` label.
-    pub fn metrics(h: *Health, w: *std.Io.Writer, served: []const u8) std.Io.Writer.Error!void {
+    /// ``GET /metrics``: Prometheus text, one ``model`` label. The three peer rows ride only with a peer
+    /// report (``peer``: rank 1's last progress, null when the engine wires none or it never reported).
+    pub fn metrics(h: *Health, w: *std.Io.Writer, served: []const u8, peer: ?api.PeerProgress) std.Io.Writer.Error!void {
         h.mutex.lockUncancelable(h.io);
         const t = now(h.io);
         const c = h.c;
@@ -394,7 +395,7 @@ pub const Health = struct {
         const uptime = secs(t - h.started);
         h.mutex.unlock(h.io);
         const Row = struct { []const u8, []const u8, []const u8, f64 };
-        const rows = [_]Row{
+        var rows: [16]Row = .{
             .{ "tensorfold_requests_total", "counter", "completions finished (errors included)", c.requests },
             .{ "tensorfold_request_errors_total", "counter", "completions that raised", c.errors },
             .{ "tensorfold_requests_rejected_total", "counter", "completions refused after a fatal error", c.rejected },
@@ -408,8 +409,18 @@ pub const Health = struct {
             .{ "tensorfold_requests_stalled", "gauge", "running completions past GLM53_TF_STALL_S", @floatFromInt(stalled_n) },
             .{ "tensorfold_engine_fatal", "gauge", "1 once the engine raised (restart both ranks)", fatal },
             .{ "tensorfold_uptime_seconds", "gauge", "seconds since the server started", uptime },
+            .{ "tensorfold_peer_age_seconds", "gauge", "seconds since rank 1's last progress report", 0 },
+            .{ "tensorfold_peer_frames_outstanding", "gauge", "plans rank 0 has sent that rank 1 has not read", 0 },
+            .{ "tensorfold_peer_failed", "gauge", "1 when rank 1's fault record is present", 0 },
         };
-        for (rows) |r| {
+        var n: usize = 13;
+        if (peer) |pp| {
+            rows[13][3] = pp.age_s;
+            rows[14][3] = @floatFromInt(pp.outstanding);
+            rows[15][3] = if (pp.faulted) 1 else 0;
+            n = 16;
+        }
+        for (rows[0..n]) |r| {
             try w.print("# HELP {s} {s}\n# TYPE {s} {s}\n{s}{{model=\"", .{ r[0], r[2], r[0], r[1], r[0] });
             for (served) |ch| switch (ch) {
                 '\\' => try w.writeAll("\\\\"),
@@ -875,3 +886,21 @@ test "health: no round has completed and a request is quiet past the round limit
     try std.testing.expect((try off.stuck(x, wedge, Rep.make(1, 600, 0))) == null);
 }
 
+test "metrics: the peer rows ride only with a peer report" {
+    const a = std.testing.allocator;
+    var h = Health.init(a, std.testing.io, .{});
+    defer h.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    try h.metrics(&out.writer, "m", null);
+    try std.testing.expect(out.written().len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tensorfold_peer_age_seconds") == null);
+    const pp: api.PeerProgress = .{ .age_s = 0.4, .transport = .roce, .plans = 9, .outstanding = 3 };
+    var with: std.Io.Writer.Allocating = .init(a);
+    defer with.deinit();
+    try h.metrics(&with.writer, "m", pp);
+    for ([_][]const u8{ "tensorfold_peer_age_seconds", "tensorfold_peer_frames_outstanding", "tensorfold_peer_failed" }) |row|
+        try std.testing.expect(std.mem.indexOf(u8, with.written(), row) != null);
+    try std.testing.expect(std.mem.indexOf(u8, with.written(), "tensorfold_peer_frames_outstanding{model=\"m\"} 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, with.written(), "tensorfold_peer_failed{model=\"m\"} 0") != null);
+}

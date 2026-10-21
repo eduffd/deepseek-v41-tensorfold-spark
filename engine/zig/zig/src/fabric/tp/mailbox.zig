@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const collective = @import("collective.zig");
 const Bootstrap = @import("bootstrap.zig").Bootstrap;
 const sock = @import("sock.zig");
+const fate = @import("fate.zig");
 const posix = std.posix;
 const DevicePtr = collective.DevicePtr;
 const DType = collective.DType;
@@ -161,7 +162,7 @@ pub const Mailbox = struct {
             .slot_bytes = m.slot_bytes,
             .timeout_ns = m.timeout_ns,
             .rank = m.me,
-            .mode = @intFromEnum(mode),
+            .mode = @backingInt(mode),
         };
         var params = [1]?*anyopaque{@ptrCast(&a)};
         const r = m.d.api.cuLaunchKernel(m.func.handle, blocksFor(n), 1, 1, threads, 1, 1, 0, stream, &params, null);
@@ -202,6 +203,29 @@ pub const Mailbox = struct {
             }
         }
         if (m.aborted.load(.acquire) or m.ctrlWord(ctrl_abort).load(.acquire) != 0) return error.Aborted;
+    }
+
+    /// `check`'s reads for rank `r`'s failure record, as a snapshot: the same words, no log, no error, no side
+    /// effect. The progress sampler's source, from a thread that must touch no GPU call, no lock, no allocator.
+    pub const MailboxProgress = struct {
+        aborted: bool,
+        failed: bool,
+        seq: u64,
+        why: fate.FaultWhy,
+        waited_us: u64,
+    };
+
+    pub fn progress(m: *const Mailbox, r: usize) MailboxProgress {
+        const rec = ctrl_rank + 8 * r;
+        const failed = m.ctrlWord(rec).load(.acquire) != 0;
+        return .{
+            .aborted = m.aborted.load(.acquire) or m.ctrlWord(ctrl_abort).load(.acquire) != 0,
+            .failed = failed,
+            .seq = m.ctrlWord(rec + 1).load(.acquire),
+            // the reading `check` gives this word: 1 is an abort of the wait, anything else its timeout
+            .why = if (failed) if (m.ctrlWord(rec + 4).load(.acquire) == 1) .abort else .timeout else .none,
+            .waited_us = m.ctrlWord(rec + 5).load(.acquire),
+        };
     }
 };
 

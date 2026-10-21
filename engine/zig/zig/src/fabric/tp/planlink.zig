@@ -23,8 +23,11 @@ pub const PlanLink = struct {
     world: u32,
     /// Rank 0: rank i's socket at index i; the others: rank 0's at index 0 (the bootstrap's `releasePlan`).
     fds: [max_ranks]sock.Fd,
-    sent: u64 = 0,
-    received: u64 = 0,
+    /// Plans written / read. One writer each, read from other threads (the fate thread's progress sampler and
+    /// rank 0's leader source), so they are atomic: a plain u64 a sampler loads is a data race the thread
+    /// sanitizer traps in the serving build.
+    sent: std.atomic.Value(u64) = .init(0),
+    received: std.atomic.Value(u64) = .init(0),
     /// TF_DSV41_PLAN_LINK=rdma (config.plan_spin_ns): the follower polls the socket this long before it blocks, so a
     /// plan is read without waking a sleeping thread (Python's rdma link spins on its mailbox flag the same way)
     spin_ns: u64 = 0,
@@ -49,7 +52,7 @@ pub const PlanLink = struct {
             if (std.c.send(fd, &len, 4, std.posix.MSG.NOSIGNAL | more) != 4) return error.PeerClosed;
             sock.sendAll(fd, bytes) catch return error.PeerClosed;
         }
-        p.sent += 1;
+        _ = p.sent.fetchAdd(1, .release);
     }
 
     /// The other ranks: the next plan into `out` (returned: the ints it holds). Blocks as long as rank 0 is idle; a
@@ -90,7 +93,7 @@ pub const PlanLink = struct {
 
     fn body(p: *PlanLink, out: []i64) Error![]i64 {
         sock.recvExact(p.fds[0], std.mem.sliceAsBytes(out), null) catch return error.PeerClosed;
-        p.received += 1;
+        _ = p.received.fetchAdd(1, .release);
         return out;
     }
 
@@ -216,6 +219,45 @@ test "plans arrive whole and in order; a closed rank 0 ends the follower" {
     try std.testing.expectError(error.TooLarge, follow.recv(&small));
     lead.close();
     try std.testing.expectError(error.PeerClosed, follow.recv(&buf));
+}
+
+test "received is readable from a foreign thread" {
+    const bootstrap = @import("bootstrap.zig");
+    const l = try bootstrap.testListener();
+    defer sock.close(l.fd);
+    const deadline = sock.nowNs() + 5 * std.time.ns_per_s;
+    const a = try sock.connect("localhost", l.port, deadline);
+    const b = try sock.accept(l.fd, deadline);
+    var f0: [max_ranks]sock.Fd = @splat(-1);
+    var f1: [max_ranks]sock.Fd = @splat(-1);
+    f0[1] = b;
+    f1[0] = a;
+    var lead = PlanLink.init(0, 2, f0);
+    defer lead.close();
+    var follow = PlanLink.init(1, 2, f1);
+    defer follow.close();
+    const Follow = struct {
+        fn run(p: *PlanLink, n: usize) void {
+            var buf: [8]i64 = undefined;
+            var got: usize = 0;
+            while (got < n) {
+                const ints = p.recv(&buf) catch return;
+                got += @intFromBool(ints[0] == 0x504C414E);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Follow.run, .{ &follow, 3 });
+    for (0..3) |i| try lead.send(&.{ 0x504C414E, @intCast(i) });
+    t.join();
+    var got: std.atomic.Value(u64) = .init(0);
+    const Reader = struct {
+        fn read(p: *PlanLink, out: *std.atomic.Value(u64)) void {
+            out.store(p.received.load(.acquire), .release);
+        }
+    };
+    const r = try std.Thread.spawn(.{}, Reader.read, .{ &follow, &got });
+    r.join();
+    try std.testing.expectEqual(@as(u64, 3), got.load(.acquire));
 }
 
 test "an admission-sized plan (1.2M words) arrives whole through the growable path" {

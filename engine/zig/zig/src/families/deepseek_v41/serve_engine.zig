@@ -182,6 +182,8 @@ pub const Served = struct {
         s.host.memory = .{ .read = readMemory };
         // /health's "graphs": each graph cache's held graphs, captures, replays, eager steps and floor state
         s.host.graphs = .{ .read = readGraphs };
+        // /health's "peer": rank 1's transport counters, read from the fate channel's lock-free snapshot
+        s.host.peer = .{ .ctx = m, .read = readPeer };
         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
         s.sched = null;
@@ -225,6 +227,55 @@ pub const Served = struct {
     fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
         const u = @import("cuda").usage(reset_peak);
         return .{ .active = u.device, .cache = 0, .peak = u.peak };
+    }
+
+    /// Rank 0's read of rank 1's last progress report, for /health and /metrics. The channel's snapshot is
+    /// lock-free, so an HTTP thread reads it with no lock and no GPU call; the counters are the follower's,
+    /// cumulative since its boot. False: no channel (fail-fast off), or the peer has never reported.
+    fn readPeer(ctx: ?*anyopaque, out: *api.PeerProgress) bool {
+        const m: *model.Model = @ptrCast(@alignCast(ctx.?));
+        if (m.session.fate) |*f| {
+            const s = f.peerProgress(1) orelse return false;
+            // the switch is total on `collective.Kind`: the channel's boundary parse validated the code, and
+            // this is where the tp enum becomes the api one — the api type's own list, never an int
+            const k: api.PeerTransport = switch (s.prog.transport) {
+                .nccl => .nccl,
+                .mailbox => .mailbox,
+                .hybrid => .hybrid,
+                .roce => .roce,
+                .host => .host,
+            };
+            out.* = .{
+                .age_s = @as(f64, @floatFromInt(s.age_ns)) / 1e9,
+                .transport = k,
+                .plans = s.prog.plans,
+                .doorbell = s.prog.doorbell,
+                .completed = s.prog.completed,
+                .proxy_seq = s.prog.proxy_seq,
+                .frozen_s = s.frozen_s,
+                .gaps = s.gaps,
+                .bad = s.bad,
+                .frames_sent = s.frames_sent,
+                .frames_received = s.frames_received,
+                .outstanding = s.outstanding,
+                .since_lockstep_s = s.since_lockstep_s,
+                .faulted = s.prog.faulted,
+                .fault_seq = s.prog.fault_seq,
+                .fault_why = switch (s.prog.fault_why) {
+                    .none => .none,
+                    .abort => .abort,
+                    .timeout => .timeout,
+                    .unknown => .unknown,
+                },
+                .waited_us = s.prog.waited_us,
+                .proxy_failed = s.prog.proxy_failed,
+                .aborted = s.prog.aborted,
+                .link_idle = s.prog.link_idle,
+                .peer_flags = s.prog.peer_flags,
+            };
+            return true;
+        }
+        return false;
     }
 
     fn readGraphs(_: ?*anyopaque, out: []api.GraphStatus) usize {
