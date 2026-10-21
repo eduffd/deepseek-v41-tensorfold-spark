@@ -5,6 +5,20 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
 
 ## Bugs fixed
 
+- **`/health` flags a pair wedged issuing its first round, and rank 1's progress reaches rank 0** (this update, fork
+  [issue #3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)). The 503 chain skipped every state
+  where no round had ever completed, so a pair frozen mid-first-round answered 200 forever (measured on the pair: 364 s
+  of 200 with four hung requests). The verdict now reads rank 0's own evidence, and it fires when a request has been
+  quiet past `TF_DSV41_STALL_ROUND_S` (120 s) plus the prompt's prefill estimate at
+  `GLM53_TF_STALL_PREFILL_TPS` (200 tok/s), so a long first prefill is never refused for being long. Measured on the
+  pair: 503 at 265 s quiet with a 26k-token first prompt, the reason string naming both numbers, and the pair heals to
+  200 when the wedge clears. Rank 1 now ships its transport counters on a progress frame over the Fate channel, at the
+  existing 0.5 s report cadence, header and payload in one whole-buffer send. `/health` grows a `peer` section (age,
+  freeze, plans, outstanding, seconds since the pair last kept pace, and the fault record only when one landed), and
+  `/metrics` grows `tensorfold_peer_age_seconds`, `tensorfold_peer_frames_outstanding` and `tensorfold_peer_failed`.
+  A progress frame never dies the pair, and a half-wedge is export only. A frozen rank 1 beside an idle rank 0 stays
+  a 200 with a growing `frozen_s` until a measured wave names the peer-keyed threshold. The wedge's root cause stays
+  open in [KNOWN-ISSUES](KNOWN-ISSUES.md).
 - **Rank 0's Zig engine exits 70 on a wedged round** (this update, fork
   [issue #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1)). The engine's own stall watch reads
   `TF_DSV41_STALL_S` (default 300 s) and `TF_DSV41_STALL_EXIT_S` (`GLM53_TF_` wins, default 0; both Zig profiles now
@@ -14,9 +28,10 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   never fires. The report names the round, the phase and both elapsed times, plus the host's running and waiting
   counts and plan sizes; it has no thread stacks, which Zig std cannot dump, so `gdb -p` remains the stack tool.
   `/health`'s stall labels are unchanged, and the replay gates (`serve_cli`, `sess4`, `mdraft`, `slots`) pass the
-  watch off. Rank 1's own watch ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)), peer-wait
-  deadlines ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and the stale mailbox
-  ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) remain open. The 300 s is above every
+  watch off. The `/health` chain blind to a first round that never ended is fixed in this update
+  ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3), the bullet above; its wedge root cause
+  stays open), and peer-wait deadlines ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and
+  the stale mailbox ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) remain open. The 300 s is above every
   measured round, but a cold whole-prompt prefill is armed from admission and p100 is unmeasured, so a legitimate
   prefill over 300 s restarts the pair.
 - **A Zig pair that dies or wedges now restarts itself** (this update, the head-side watchdog on the Zig profile).

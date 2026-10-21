@@ -6,9 +6,14 @@
   `results/verify/20261019-213006/`). A round in flight never returns, and rank 1 waits in the TP exchange. Rank 0's
   engine watch now exits 70 when its round in flight passes `TF_DSV41_STALL_EXIT_S` (300 in both Zig profiles), so the
   watchdog restarts both ranks ([issue
-  #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1), fixed). Still open: no deadline on any peer
-  wait ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)), a watchdog on rank 0 that is blind to
-  a rank-1-side wedge ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)), and a mailbox timeout
+  #1](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/1), fixed). Issue
+  [#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3) closed for its `/health` scope. The verdict
+  now flags a first round that never ends (measured 503 at 265 s quiet on the pair's 26k-token first prompt, against
+  200 for 364 s at HEAD), and rank 1's transport progress rides the Fate channel into the `peer` section and
+  `/metrics`, so a rank-1-side wedge is visible there as a growing `frozen_s` and outstanding plans. The wedge itself
+  is the open half of #3, and a peer-keyed verdict waits on a measured threshold (OPERATIONS "Knobs").
+  Still open: no deadline on any peer
+  wait ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)), and a mailbox timeout
   that leaves stale buffers live
   ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)). That day's recovery was a human: stop the
   pair, start it again, ready in 122 s, about 80 minutes after the pair went dead. The self-heal watchdog
