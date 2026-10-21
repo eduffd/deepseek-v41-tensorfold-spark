@@ -102,9 +102,15 @@ Host memory and stalls (G12; defaults in brackets):
   `TF_DSV41_STALL_S` (default 0), and its stall labels read `TF_DSV41_STALL_ROUND_S` (120) and
   `TF_DSV41_STALL_SLOW_S` (180). `GLM53_TF_STALL_S` and `GLM53_TF_STALL_EXIT_S` win over the `TF_DSV41_` spellings, and
   the replay gates pass the watch off. The fail-fast exit 70 (`TF_DSV41_FAILFAST`) is separate, and the watchdog heals
-  either on its first tick. Rank 1 has no watch of its own yet (fork issue
-  [eduffd/deepseek-v41-tensorfold-spark#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3)); peer
-  waits ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and the stale mailbox
+  either on its first tick. With work in flight and no round ever completed, `/health` answers 503 once a request has
+  been quiet past `TF_DSV41_STALL_ROUND_S` plus the prompt's prefill estimate at `GLM53_TF_STALL_PREFILL_TPS` (200;
+  0 on either knob turns this null-gap verdict off), the gap the pair measured answering 200 for 364 s at
+  [eduffd/deepseek-v41-tensorfold-spark#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3). Rank 1
+  ships its transport progress to rank 0 over the Fate channel, and `/health`'s `peer` section reports its age, freeze,
+  outstanding plans and seconds since the pair last kept pace, with three peer gauges on `/metrics`. The peer data is
+  export only. A frozen rank 1 beside an idle rank 0 stays a 200 with a growing `frozen_s`, and a peer-keyed verdict
+  ships in a later wave with a threshold measured from a pair. Peer waits
+  ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and the stale mailbox
   ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) stay open
   ([KNOWN-ISSUES](KNOWN-ISSUES.md)).
 - `TF_DSV41_ENGRAM_WAIT_S` (300; 0 = none): deadline on an Engram read and on the Engram gate's worker.
