@@ -290,4 +290,6 @@ test {
     _ = @import("roce_inflight_test.zig");
     _ = @import("host_test.zig");
     _ = @import("fate_test.zig");
+    _ = @import("peerwait_test.zig");
+    _ = @import("planlink_stall_test.zig");
 }

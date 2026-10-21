@@ -93,10 +93,24 @@ fn waitReadable(fd: Fd, deadline_ns: u64) Error!void {
     }
 }
 
-/// Every byte of `bytes`, or `error.Closed`.
-pub fn sendAll(fd: Fd, bytes: []const u8) Error!void {
+fn waitWritable(fd: Fd, deadline_ns: u64) Error!void {
+    while (true) {
+        const t = nowNs();
+        if (t >= deadline_ns) return error.Timeout;
+        const ms: c_int = @intCast(@min((deadline_ns - t) / std.time.ns_per_ms + 1, 1000));
+        var p = [_]c.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+        const n = c.poll(&p, 1, ms);
+        if (n > 0) return;
+    }
+}
+
+/// Every byte of `bytes`, `error.Closed` at the end of the stream, or `error.Timeout` past `deadline_ns`
+/// (null: no deadline, forever). A peer that died is Closed and one that stopped reading is Timeout: the
+/// departure and the wedge stay distinguishable, and a partial write that later stalls is the wedge.
+pub fn sendAll(fd: Fd, bytes: []const u8, deadline_ns: ?u64) Error!void {
     var off: usize = 0;
     while (off < bytes.len) {
+        if (deadline_ns) |d| try waitWritable(fd, d);
         const n = c.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
         if (n <= 0) {
             if (n < 0 and posix.errno(n) == .INTR) continue;
@@ -159,11 +173,33 @@ test "a listener and a client trade bytes and see the hang-up" {
     defer close(a);
     const b = try accept(l, deadline);
     defer close(b);
-    try sendAll(a, "hello");
+    try sendAll(a, "hello", null);
     var got: [5]u8 = undefined;
     try recvExact(b, &got, deadline);
     try std.testing.expectEqualStrings("hello", &got);
     try std.testing.expectError(error.Timeout, recvExact(b, &got, nowNs() + 20 * std.time.ns_per_ms));
     hangup(a);
     try std.testing.expectError(error.Closed, recvExact(b, &got, deadline));
+}
+
+test "a send past a peer that stopped reading times out; a peer that died is Closed" {
+    const l = try listen(0);
+    defer close(l);
+    var addr: posix.sockaddr.in = undefined;
+    var len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
+    try std.testing.expectEqual(@as(c_int, 0), c.getsockname(l, @ptrCast(&addr), &len));
+    const port = std.mem.bigToNative(u16, addr.port);
+    const deadline = nowNs() + 5 * std.time.ns_per_s;
+    const a = try connect("localhost", port, deadline);
+    defer close(a);
+    const b = try accept(l, deadline);
+    defer close(b);
+    const small: c_int = 8192;
+    _ = c.setsockopt(a, posix.SOL.SOCKET, posix.SO.SNDBUF, &small, @sizeOf(c_int));
+    // b never reads: the sockets hold far less than the frame, so the send parks in a full window
+    const big = try std.testing.alloc(u8, 8 << 20);
+    defer std.testing.allocator.free(big);
+    try std.testing.expectError(error.Timeout, sendAll(a, big, nowNs() + 150 * std.time.ns_per_ms));
+    hangup(b);
+    try std.testing.expectError(error.Closed, sendAll(a, "x", null));
 }
