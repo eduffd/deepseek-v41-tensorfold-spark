@@ -8,6 +8,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const tp = @import("tp");
+const api = @import("engine_api");
 const calls = @import("calls.zig");
 const block = @import("block.zig");
 const buffers = @import("buffers.zig");
@@ -75,6 +76,11 @@ pub const Forward = struct {
     layers: ?[]const u32 = null,
     /// TP: rank 0 leads (sends each forward operation to the others over the plan link); the others `follow`
     link: ?*tp.planlink.PlanLink = null,
+    /// the TP session (world > 1, model.zig): the peer-wait clock's round bracket and its round check
+    tp_session: ?*tp.Session = null,
+    /// a follower's round witness (serve_cli installs it on TF_DSV41_PEER_WAIT_S): the age of the round the leader
+    /// opened for this rank, which is not the same thing as the silence the session clock watches
+    watch: ?*api.stall.Watch = null,
     /// a follower's drafter (the leader's lanes ask its pass; every rank runs it)
     drafter: ?Drafter = null,
     /// M2a: each block's traced streams (block.Options.trace) as SHA-256 hex by layer, for the last window
@@ -237,6 +243,11 @@ pub const Forward = struct {
         if (ids.len == 0) return;
         f.gated = false; // prompt segments read their rows on the old path
         if (f.leads()) {
+            // the rows this prompt admits: rank 1 reads the same number off these frames, so both ranks' bounds
+            // widen by the same allowance
+            if (f.tp_session) |s| {
+                if (s.peerOn()) s.peerRows(ids.len);
+            }
             // [op, total, offset, ids...] frames (planlink takes up to 64M words a frame; a prompt is a few)
             const frame: usize = 1 << 20;
             const msg = try f.gpa.alloc(i64, 3 + @min(frame, ids.len));
@@ -528,6 +539,11 @@ pub const Forward = struct {
         if (segs.len == 0) return;
         f.gated = false;
         if (f.leads()) {
+            var rows: u64 = 0;
+            for (segs) |sg| rows += sg.ids.len;
+            if (f.tp_session) |s| {
+                if (s.peerOn()) s.peerRows(rows);
+            }
             var msg: std.ArrayList(i64) = .empty;
             defer msg.deinit(f.gpa);
             try msg.appendSlice(f.gpa, &.{ op_pf_multi, @intCast(segs.len) });
@@ -721,6 +737,32 @@ pub const Forward = struct {
         if (f.leads()) if (f.on_stop) |h| h.run(h.ctx);
     }
 
+    /// Rank 0's round bracket on the plan stream, from the host's stamps (serve_engine installs the hook): this
+    /// rank's clock arms and widens by what the round admits *before* the open frame goes out, so the frame's own
+    /// send is deadline-bounded like any other plan.
+    pub fn roundOpen(f: *Forward, round_no: u64, rows: u64) void {
+        const s = f.tp_session orelse return;
+        s.peerRoundBegin(round_no);
+        s.peerRows(rows);
+        f.link.?.sendRoundOpen(round_no) catch |e| std.log.scoped(.dsv41).warn("rank 0: round {d} open frame refused ({t})", .{ round_no, e });
+    }
+
+    /// The round boundary: disarm first, so the close frame is not bounded by the wait of a round already over, then
+    /// close it on the stream.
+    pub fn roundClose(f: *Forward) void {
+        const s = f.tp_session orelse return;
+        s.peerRoundEnd();
+        f.link.?.sendRoundClose() catch |e| std.log.scoped(.dsv41).warn("rank 0: round {d} close frame refused ({t})", .{ s.peer.round_no.load(.acquire), e });
+    }
+
+    /// Where the follower stands inside a round: which expiry a silence on this rank becomes (a plan read still
+    /// coming, or a device wait it is running).
+    fn peerPhase(f: *Forward, p: tp.peerwait.Phase) void {
+        if (f.tp_session) |s| {
+            if (s.peerOn()) s.peerPhase(p);
+        }
+    }
+
     /// Ranks > 0: run the leader's operations as they arrive, in its order (every collective then pairs up), until
     /// `stop`. The window's token ids come with it; greedy's choice is computed here too (its all-gather needs every
     /// rank) and dropped. A prefill's prompt comes in frames; the last one starts it.
@@ -735,7 +777,11 @@ pub const Forward = struct {
         var picks: std.ArrayList(u32) = .empty;
         defer picks.deinit(f.gpa);
         while (true) {
+            f.peerPhase(.plan_recv);
+            if (f.watch) |w| w.phase(.plan_wait);
             const msg = try f.link.?.recvGrow(f.gpa, &buf);
+            f.peerPhase(.device);
+            if (f.watch) |w| w.phase(.replay);
             if (msg.len == 0) return error.BadPlan;
             const ended = f.followOp(msg, &ids, &prompt, &picks) catch |e| {
                 // Runner.guard failed the leader's same window before any launch: only its request fails
@@ -750,6 +796,18 @@ pub const Forward = struct {
     /// One of the leader's operations (follow); true: `stop`.
     fn followOp(f: *Forward, msg: []const i64, ids: *std.ArrayList(u32), prompt: *std.ArrayList(u32), picks: *std.ArrayList(u32)) !bool {
         switch (msg[0]) {
+            // the round bracket: this rank's clocks arm on the leader's number, so a report from either rank names
+            // the same round
+            tp.planlink.op_round_open => {
+                if (msg.len != 2) return error.BadPlan;
+                const rn: u64 = @bitCast(msg[1]);
+                if (f.tp_session) |s| s.peerRoundBegin(rn);
+                if (f.watch) |w| w.begin(rn, .plan_wait);
+            },
+            tp.planlink.op_round_close => {
+                if (f.tp_session) |s| s.peerRoundEnd();
+                if (f.watch) |w| w.end();
+            },
             op_window => {
                 const n: usize = @intCast(msg[1]);
                 ids.clearRetainingCapacity();
@@ -762,6 +820,11 @@ pub const Forward = struct {
             },
             op_prefill => {
                 const total: usize = @intCast(msg[1]);
+                // the prompt the leader admitted widens this rank's bound the same way its own widened: an honest
+                // long prefill is not a wedge
+                if (f.tp_session) |s| {
+                    if (s.peerOn()) s.peerRows(total);
+                }
                 const at: usize = @intCast(msg[2]);
                 if (at == 0) prompt.clearRetainingCapacity();
                 if (at != prompt.items.len) return error.BadPlan;
@@ -812,6 +875,9 @@ pub const Forward = struct {
                 var segs: [16]pf.MultiSeg = undefined;
                 prompt.clearRetainingCapacity();
                 for (msg[2 + 3 * ns ..]) |t| try prompt.append(f.gpa, @intCast(t));
+                if (f.tp_session) |s| {
+                    if (s.peerOn()) s.peerRows(prompt.items.len);
+                }
                 var at: usize = 0;
                 for (segs[0..ns], 0..) |*sg, j| {
                     const n: usize = @intCast(msg[4 + 3 * j]);

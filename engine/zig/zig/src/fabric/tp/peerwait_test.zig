@@ -212,6 +212,22 @@ test "a round that ends inside its own report line is not expired" {
     try std.testing.expectEqual(@as(u32, 0), exits.load(.acquire));
 }
 
+test "a fault a witness saw outside the silence stands even with the round closed" {
+    exits.store(0, .release);
+    var cap: Cap = .{};
+    var c = clock(1, 400, 0, &cap, null);
+    c.beginRound(5);
+    c.endRound(); // a silence expiry would stand down here; a witness's does not
+    try std.testing.expect(c.fault(.{ .round_watch = .{ .rank = 1, .round = 5 } }));
+    try std.testing.expectEqual(@as(u32, 1), exits.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), cap.n);
+    try std.testing.expect(std.mem.indexOf(u8, cap.at(0), "round watch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cap.at(0), "round 5") != null);
+    try std.testing.expect(!c.fault(.{ .round_watch = .{ .rank = 1, .round = 5 } })); // one latch, as any other route
+    try std.testing.expectEqual(@as(u32, 1), exits.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), cap.n);
+}
+
 test "one expiry prints one named line, the FAIL frame carries its reason, and a second expiry changes nothing" {
     exits.store(0, .release);
     var fates: [2]fate.Fate = undefined;

@@ -42,6 +42,14 @@ pub const Config = struct {
     roce_chunked_bytes: usize = 0,
     /// A mailbox wait for the peer gives up after this long and poisons the transport (fail-stop).
     mailbox_timeout_ns: u64 = 120 * std.time.ns_per_s,
+    /// TF_DSV41_PEER_WAIT_S (GLM53_TF_PEER_WAIT_S wins when both are set, the stall knobs' convention): how long a
+    /// rank waits inside a round for its peer to keep moving before it names the wait and takes the pair down
+    /// (peerwait.zig). 0: off, and the reads and sends block forever as they always did. A wait below the mailbox
+    /// timeout above is refused at boot: the device's own fault record has to arrive first.
+    peer_wait_ns: u64 = 0,
+    /// GLM53_TF_STALL_PREFILL_TPS, the /health verdict's own rate knob (spark.zig): an admitted prompt widens a
+    /// peer wait by rows / this, so the two allowances cannot drift.
+    prefill_tps: f64 = 200,
     failfast: bool = true,
     /// After a failure: time for the HTTP threads to answer before exit 70.
     grace_ns: u64 = std.time.ns_per_s,
@@ -94,6 +102,25 @@ pub const Config = struct {
         }
         c.roce_chunked_bytes = 1024 * try int(usize, get, "TF_TP_ROCE_CHUNKED_KB", 0, 0, 64 * 1024);
         c.mailbox_timeout_ns = try seconds(get, "TF_TP_MAILBOX_TIMEOUT_S", 120, 0.001, 86400);
+        // the two names parsed by hand, GLM53 first: `alias` is TF-wins, and OPERATIONS says GLM53_TF_ spellings win
+        c.peer_wait_ns = if (get("GLM53_TF_PEER_WAIT_S") != null)
+            try seconds(get, "GLM53_TF_PEER_WAIT_S", 0, 0, 86400)
+        else
+            try seconds(get, "TF_DSV41_PEER_WAIT_S", 0, 0, 86400);
+        if (c.peer_wait_ns > 0 and c.peer_wait_ns < c.mailbox_timeout_ns) {
+            std.log.warn("peer wait {d:.0} s (GLM53_TF_PEER_WAIT_S / TF_DSV41_PEER_WAIT_S) is below the mailbox timeout {d:.0} s (TF_TP_MAILBOX_TIMEOUT_S): the transport's own fault record must land before a peer wait names one; set the peer wait at or above the timeout", .{
+                @as(f64, @floatFromInt(c.peer_wait_ns)) / 1e9, @as(f64, @floatFromInt(c.mailbox_timeout_ns)) / 1e9,
+            });
+            return error.BadSetting;
+        }
+        if (get("GLM53_TF_STALL_PREFILL_TPS")) |v| {
+            const x = std.fmt.parseFloat(f64, std.mem.trim(u8, v, " ")) catch std.math.nan(f64);
+            if (!std.math.isFinite(x) or x < 0) {
+                std.log.warn("GLM53_TF_STALL_PREFILL_TPS={s}: expected a number >= 0", .{v});
+                return error.BadSetting;
+            }
+            c.prefill_tps = x;
+        }
         if (get("TF_DSV41_FAILFAST")) |v| c.failfast = !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off"));
         c.grace_ns = try seconds(get, "TF_DSV41_FAILFAST_GRACE_S", 1.0, 0, 60);
         c.report_ns = try seconds(get, "TF_DSV41_PEER_MEM_S", 0.5, 0.01, 60);
@@ -261,6 +288,42 @@ test "boot refuses any setting that asks for an RDMA write past 1 MiB" {
     }
     Fake.pairs = &.{ .{ "TF_COMM_BACKEND", "roce" }, .{ "GLM53_TF_ROCE_MAX_KB", "1024" }, .{ "TF_TP_ROCE_VAR_KB", "1024" } };
     try std.testing.expectEqual(@as(usize, 1 << 20), (try Config.parse(&Fake.get)).roceSlotBytes());
+}
+
+test "the peer wait: GLM53 wins, a wait under the mailbox timeout refuses boot, the digest ignores it" {
+    Fake.pairs = &.{};
+    const off = try Config.parse(&Fake.get);
+    try std.testing.expectEqual(@as(u64, 0), off.peer_wait_ns);
+    try std.testing.expectEqual(@as(f64, 200), off.prefill_tps);
+
+    Fake.pairs = &.{.{ "TF_DSV41_PEER_WAIT_S", "600" }};
+    try std.testing.expectEqual(600 * std.time.ns_per_s, (try Config.parse(&Fake.get)).peer_wait_ns);
+    Fake.pairs = &.{ .{ "TF_DSV41_PEER_WAIT_S", "600" }, .{ "GLM53_TF_PEER_WAIT_S", "900" } };
+    try std.testing.expectEqual(900 * std.time.ns_per_s, (try Config.parse(&Fake.get)).peer_wait_ns);
+
+    // the boot-order guard: the transport's own fault record has to land before a peer wait can name one
+    Fake.pairs = &.{.{ "GLM53_TF_PEER_WAIT_S", "60" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    Fake.pairs = &.{ .{ "TF_DSV41_PEER_WAIT_S", "1" }, .{ "TF_TP_MAILBOX_TIMEOUT_S", "120" } };
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
+    // the bound of the ordering boots, and off boots whatever the timeout is
+    Fake.pairs = &.{.{ "GLM53_TF_PEER_WAIT_S", "120" }};
+    try std.testing.expectEqual(120 * std.time.ns_per_s, (try Config.parse(&Fake.get)).peer_wait_ns);
+    Fake.pairs = &.{ .{ "TF_DSV41_PEER_WAIT_S", "0" }, .{ "TF_TP_MAILBOX_TIMEOUT_S", "30" } };
+    try std.testing.expectEqual(@as(u64, 0), (try Config.parse(&Fake.get)).peer_wait_ns);
+
+    // a bound a rank sets for its own waits, like the other timeouts: it stays out of the digest both ranks compare
+    Fake.pairs = &.{};
+    const d0 = (try Config.parse(&Fake.get)).digest();
+    Fake.pairs = &.{.{ "GLM53_TF_PEER_WAIT_S", "600" }};
+    const d1 = (try Config.parse(&Fake.get)).digest();
+    try std.testing.expectEqualSlices(u8, &d0, &d1);
+
+    // the widening arrives on the rate knob the /health verdict already reads, and a bad value is refused
+    Fake.pairs = &.{.{ "GLM53_TF_STALL_PREFILL_TPS", "1000" }};
+    try std.testing.expectEqual(@as(f64, 1000), (try Config.parse(&Fake.get)).prefill_tps);
+    Fake.pairs = &.{.{ "GLM53_TF_STALL_PREFILL_TPS", "-1" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
 }
 
 test "prod.env's names: GLM53_TF_* where ours are unset, the plan link's spin and pin" {
