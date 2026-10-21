@@ -34,6 +34,11 @@ pub const Session = struct {
     /// The round plan's link (rank 0 sends, the others receive), on its own TCP connection.
     plan: planlink.PlanLink = undefined,
     fate: ?Fate = null,
+    /// The fate thread's frozen watch: the last sample's counters, and when they last moved. ONE writer: the
+    /// fate thread calls `progress` once per report period; the frozen bookkeeping mutates state, so no other
+    /// thread calls it.
+    last_sample: ?fate.Progress = null,
+    moved_at: u64 = 0,
 
     /// Brings this rank up (in place: the session's address must not change afterwards). `kernel_image` is
     /// mailbox.cu's fatbin (the mailbox and RoCE kernels), empty when the build has none: those backends then use
@@ -70,6 +75,10 @@ pub const Session = struct {
         if (cfg.failfast) {
             s.fate = Fate.init(cfg, b.release());
             s.fate.?.onFail(.{ .ctx = s, .call = abortHook });
+            // armed before the thread spawns: a field a running thread never races. The session's address is
+            // fixed for its whole life (`open` runs in place; `close` joins the fate thread before teardown)
+            s.fate.?.setProgress(.{ .ctx = s, .read = progressFrame });
+            if (cfg.rank == 0) s.fate.?.setLeaderProgress(.{ .ctx = s, .read = leaderSent });
             try s.fate.?.start();
         }
         std.log.info("[tensorfold] tp: rank {d} of {d} up ({t}, NCCL {d}, fail-fast {s}, roce fast {s}: {d} poller(s), stagger {d} ns)", .{ cfg.rank, cfg.world, s.comm().kind(), v, if (cfg.failfast) "on" else "off", if (cfg.roce_fast & 1 != 0) "on" else "off", (cfg.roce_fast >> 8) & 0xff, cfg.roce_fast >> 16 });
@@ -175,6 +184,64 @@ pub const Session = struct {
     pub fn comm(s: *Session) Collective {
         if (s.mail != null or s.roce != null) return s.route.iface();
         return s.nccl.iface();
+    }
+
+    /// This rank's transport progress: every word is an atomic host load, so it touches no GPU call, no lock
+    /// and no allocation (the sampler's contract). `at`: this rank's monotonic clock at the send. Counters are
+    /// cumulative since this rank's boot. One writer — the fate thread, once per report period.
+    pub fn progress(s: *Session, at: u64) fate.Progress {
+        var p: fate.Progress = .{
+            .transport = s.comm().kind(),
+            .plans = s.plan.received.load(.acquire),
+        };
+        if (s.roce) |r| {
+            const x = r.progress();
+            p.doorbell = x.doorbell;
+            p.completed = x.completed;
+            p.proxy_seq = x.proxy_seq;
+            p.faulted = x.faulted;
+            p.fault_seq = x.fault_seq;
+            p.fault_why = x.fault_why;
+            p.waited_us = x.waited_us;
+            p.proxy_failed = x.proxy_failed;
+            p.aborted = x.aborted;
+            p.link_idle = x.link_idle;
+            p.peer_flags = x.flags;
+        }
+        if (s.mail) |*m| {
+            const x = m.progress(s.cfg.rank);
+            p.faulted = p.faulted or x.failed;
+            p.aborted = p.aborted or x.aborted;
+            if (x.failed) {
+                p.fault_seq = x.seq;
+                p.fault_why = x.why;
+                p.waited_us = x.waited_us;
+            }
+        }
+        if (s.last_sample) |l| {
+            p.report_seq = l.report_seq + 1;
+            const moved = p.plans != l.plans or p.doorbell != l.doorbell or p.completed != l.completed or
+                p.proxy_seq != l.proxy_seq or p.fault_seq != l.fault_seq or p.faulted != l.faulted;
+            if (moved) s.moved_at = at;
+            p.frozen_ns = at -| s.moved_at;
+        } else {
+            p.report_seq = 1;
+            s.moved_at = at;
+        }
+        s.last_sample = p;
+        return p;
+    }
+
+    fn progressFrame(ctx: *anyopaque, out: *fate.Progress) void {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        out.* = s.progress(sock.nowNs());
+    }
+
+    /// Rank 0's plans sent, read at each progress frame's arrival: plans the leader wrote that the follower has
+    /// not read is a wedge's size.
+    fn leaderSent(ctx: *anyopaque) u64 {
+        const s: *const Session = @ptrCast(@alignCast(ctx));
+        return s.plan.sent.load(.acquire);
     }
 
     /// This rank failed inside a round: every rank goes down (exit 70). Without fail-fast it only aborts.

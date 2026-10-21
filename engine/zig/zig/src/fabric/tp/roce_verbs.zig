@@ -96,7 +96,9 @@ const Hca = struct {
     gid: [16]u8,
     mtu: u32,
     lid: u16,
-    outstanding: u32 = 0,
+    /// Posts on the queue pair and not yet reaped: the proxy writes it, `quiesce` and `report` read it from
+    /// other threads, so it is atomic.
+    outstanding: std.atomic.Value(u32) = .init(0),
     /// Each outstanding post's stripe bytes, oldest at `head` (completions arrive in order).
     ring: [ring_len]u32 = undefined,
     head: u32 = 0,
@@ -282,7 +284,7 @@ pub const VerbsWire = struct {
     pub fn quiesce(w: *VerbsWire, timeout_ns: u64) bool {
         if (!w.halt()) return false;
         const t0 = sock.nowNs();
-        for (w.hcas[0..w.n_hca]) |*h| while (h.outstanding > 0) {
+        for (w.hcas[0..w.n_hca]) |*h| while (h.outstanding.load(.acquire) > 0) {
             var wc: [32]abi.Wc = undefined;
             const n = h.ctx.ops.poll_cq(h.cq, 32, &wc);
             if (n < 0) return false;
@@ -318,7 +320,7 @@ pub const VerbsWire = struct {
             out.print("posted {d}, completed {d}; ", .{ h.posts.load(.acquire), h.done.load(.acquire) }) catch break;
         }
         var held: u64 = 0;
-        for (w.hcas[0..w.n_hca]) |h| held += h.outstanding;
+        for (w.hcas[0..w.n_hca]) |h| held += h.outstanding.load(.acquire);
         out.print("reaped {d} (flushed {d}), still posted {d}", .{ w.reaped, w.flushed, held }) catch {};
         return out.buffered();
     }
@@ -378,7 +380,7 @@ pub const VerbsWire = struct {
         while (w.inflight() + padded > max_inflight) try w.reapWait();
         var seq_copy = seq;
         for (w.hcas[0..w.n_hca], plan[0..w.n_hca], 0..) |*h, s, i| {
-            while (h.outstanding >= ring_len) try w.reapHca(h);
+            while (h.outstanding.load(.monotonic) >= ring_len) try w.reapHca(h);
             var flag_sge: abi.Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
             var flag_wr: abi.SendWr = .{ .wr_id = seq, .sg_list = @ptrCast(&flag_sge), .num_sge = 1, .opcode = abi.wr_rdma_write, .send_flags = abi.send_signaled | abi.send_inline, .remote_addr = w.peer_region + s.flag, .rkey = w.peer_rkey[i] };
             var data_sge: abi.Sge = .{ .addr = @intFromPtr(w.region.ptr) + s.local, .length = s.len, .lkey = h.mr.lkey };
@@ -386,8 +388,10 @@ pub const VerbsWire = struct {
             var bad: ?*abi.SendWr = null;
             const first: *abi.SendWr = if (s.len > 0) &data_wr else &flag_wr;
             if (h.ctx.ops.post_send(h.qp, first, &bad) != 0) return error.PostFailed;
-            h.ring[(h.head + h.outstanding) % ring_len] = s.len;
-            h.outstanding += 1;
+            const held = h.outstanding.load(.monotonic);
+            h.ring[(h.head + held) % ring_len] = s.len;
+            // the release store publishes the ring slot a reader reads before it pops the count it sees
+            h.outstanding.store(held + 1, .release);
             h.inflight += s.len;
             _ = h.posts.fetchAdd(1, .release);
         }
@@ -416,7 +420,7 @@ pub const VerbsWire = struct {
             h.inflight -= h.ring[h.head];
             h.head = (h.head + 1) % ring_len;
         }
-        h.outstanding -= n;
+        _ = h.outstanding.fetchSub(n, .release);
         w.completed += n;
         _ = h.done.fetchAdd(n, .release);
     }

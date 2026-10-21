@@ -114,12 +114,110 @@ fn encode(p: Progress) ProgressWire {
     };
 }
 
+/// The boundary parse, the only decode of a wire code. A transport code outside the five kinds refuses the
+/// frame; a fault whose `why` no shipped reader explains reads as a timeout (`mailbox.check` and
+/// `roce.check` both read it that way), and a code above the known ones is a broken kernel made visible.
+fn decode(w: ProgressWire) ?Progress {
+    const transport = switch (w.transport) {
+        0 => Kind.nccl,
+        1 => .mailbox,
+        2 => .hybrid,
+        3 => .roce,
+        4 => .host,
+        else => return null,
+    };
+    const faulted = w.bits & 1 != 0;
+    return .{
+        .transport = transport,
+        .plans = w.plans,
+        .doorbell = w.doorbell,
+        .completed = w.completed,
+        .proxy_seq = w.proxy_seq,
+        .frozen_ns = w.frozen_ns,
+        .report_seq = w.report_seq,
+        .faulted = faulted,
+        .fault_seq = w.fault_seq,
+        .fault_why = if (!faulted) .none else switch (w.fault_why) {
+            1 => .abort,
+            0, 2 => .timeout,
+            else => .unknown,
+        },
+        .waited_us = w.waited_us,
+        .proxy_failed = w.bits & 2 != 0,
+        .aborted = w.bits & 4 != 0,
+        .link_idle = w.bits & 8 != 0,
+        .peer_flags = .{ w.peer_flag0, w.peer_flag1 },
+    };
+}
+
+// the codes `decode` accepted, read back out of the slot: total by construction, so each `unreachable` is
+// the compiler's guarantee and not a runtime path
+fn kindOf(code: u32) Kind {
+    return switch (code) {
+        0 => .nccl,
+        1 => .mailbox,
+        2 => .hybrid,
+        3 => .roce,
+        4 => .host,
+        else => unreachable,
+    };
+}
+
+fn whyOf(code: u32) FaultWhy {
+    return switch (code) {
+        0 => .none,
+        1 => .abort,
+        2 => .timeout,
+        3 => .unknown,
+        else => unreachable,
+    };
+}
+
 /// A rank's own progress sampler. `read` must touch no lock, no GPU call and no allocation: it loads
 /// host-mapped atomic words and the atomic plan counter.
 pub const ProgressSource = struct { ctx: *anyopaque, read: *const fn (ctx: *anyopaque, out: *Progress) void };
 /// The leader's own plan-sent counter, read at each progress frame's arrival: it makes a wedge's size visible
 /// (plans the leader sent that the follower has not read). Null on ranks that are not the leader.
 pub const LeaderSource = struct { ctx: *anyopaque, read: *const fn (ctx: *anyopaque) u64 };
+
+/// One progress frame written as the sender would not write it, for a test of the boundary parse: `declared`
+/// is the header's length, the payload is a contract-shaped wire carrying `raw`. One send, so a frame the
+/// reader accepts leaves the stream aligned.
+pub const RawWire = extern struct { plans: u64 = 0, transport: u32 = 0, fault_why: u32 = 0, bits: u32 = 0 };
+pub fn writeProgressRaw(fd: sock.Fd, declared: usize, raw: RawWire) bool {
+    const w: ProgressWire = .{
+        .plans = raw.plans,
+        .doorbell = 0,
+        .completed = 0,
+        .proxy_seq = 0,
+        .frozen_ns = 0,
+        .report_seq = 0,
+        .fault_seq = 0,
+        .waited_us = 0,
+        .peer_flag0 = 0,
+        .peer_flag1 = 0,
+        .transport = raw.transport,
+        .fault_why = raw.fault_why,
+        .bits = raw.bits,
+    };
+    const head: Frame = .{ .magic = magic, .kind = kind_progress, .value = @intCast(declared) };
+    var buf: [16 + 96]u8 = undefined;
+    @memcpy(buf[0..16], std.mem.asBytes(&head));
+    @memcpy(buf[16..], std.mem.asBytes(&w));
+    return sock.trySend(fd, buf[0 .. 16 + @min(declared, 96)]);
+}
+
+/// Reads and discards `n` bytes so a frame's payload ends where the next header starts. `readFrame` clamps
+/// the declared length, so this loop is bounded by that clamp.
+fn drain(fd: sock.Fd, n: usize, deadline: u64) void {
+    var buf: [256]u8 = undefined;
+    var left: usize = n;
+    while (left > 0) {
+        const take = @min(left, buf.len);
+        sock.recvExact(fd, buf[0..take], deadline) catch return;
+        left -= take;
+    }
+}
 
 /// A callback with its context (an abort of a collective, rank 0's request failing); `reason` lives until exit.
 pub const Hook = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, reason: []const u8) void };
@@ -277,6 +375,132 @@ pub const Fate = struct {
 
     /// Rank 0's read of peer `r`'s newest report: the counters, the ages, and the channel's own honesty
     /// counters. Null before its first frame — no evidence, so a reader shows no peer at all.
+    pub const Sample = struct {
+        prog: Progress,
+        /// seconds since this frame's arrival on the reader's clock: the channel's age (a dropped frame ages
+        /// the peer out: staleness is a fact, never a stall)
+        age_ns: u64,
+        /// the peer's counters have not moved this long, its age included
+        frozen_s: f64,
+        gaps: u64,
+        bad: u64,
+        /// reports the peer wrote
+        frames_sent: u64,
+        /// reports this rank accepted
+        frames_received: u64,
+        /// plans the leader sent that the peer has not read: a wedge's size, 0 in lockstep
+        outstanding: u64,
+        /// seconds since the pair last kept pace; null: never reported in lockstep
+        since_lockstep_s: ?f64,
+    };
+
+    pub fn peerProgress(f: *const Fate, r: u32) ?Sample {
+        const s: *Slot = @constCast(&f.prog[r]);
+        var spins: u32 = 0;
+        while (true) : (spins += 1) {
+            const s1 = s.seq.load(.acquire);
+            const small = s.small.load(.monotonic);
+            const p: Progress = .{
+                .plans = s.plans.load(.monotonic),
+                .doorbell = s.doorbell.load(.monotonic),
+                .completed = s.completed.load(.monotonic),
+                .proxy_seq = s.proxy_seq.load(.monotonic),
+                .frozen_ns = s.frozen_ns.load(.monotonic),
+                .report_seq = s.report_seq.load(.monotonic),
+                .fault_seq = s.fault_seq.load(.monotonic),
+                .waited_us = s.waited_us.load(.monotonic),
+                .peer_flags = .{ s.peer_flag0.load(.monotonic), s.peer_flag1.load(.monotonic) },
+                .transport = kindOf(small & 0xff),
+                .fault_why = whyOf((small >> 8) & 0xff),
+                .faulted = small & (1 << 16) != 0,
+                .proxy_failed = small & (1 << 17) != 0,
+                .aborted = small & (1 << 18) != 0,
+                .link_idle = small & (1 << 19) != 0,
+            };
+            const at = s.at.load(.monotonic);
+            if (at == 0) return null;
+            // every field this snapshot reports, including the channel's own counters, loads inside the
+            // window the marker validates — the CAS below proves none of them moved
+            const got = s.frames_stored.load(.monotonic);
+            const lead = s.leader_sent.load(.monotonic);
+            const lockstep = s.lockstep_at.load(.monotonic);
+            const gaps = s.gaps.load(.monotonic);
+            const bad = s.bad.load(.monotonic);
+            // The second check is an Add-0 seq_cst RMW: a real RMW is a full barrier, and it fences
+            // the field loads above. Zig 0.17 lowers a no-op CAS to a plain load, and a plain load
+            // only orders the accesses after it, so torn field reads complete after its seq read and
+            // pass validation as undivided. The marker is a counter, so a completed epoch reads back
+            // s1 + 2 and fails the comparison.
+            const s2 = s.seq.rmw(.Add, @as(u32, 0), .seq_cst);
+            const age_ns = sock.nowNs() -| at;
+            var snap: Sample = .{
+                .prog = p,
+                .age_ns = age_ns,
+                .frozen_s = @as(f64, @floatFromInt(p.frozen_ns +| age_ns)) / 1e9,
+                .gaps = gaps,
+                .bad = bad,
+                .frames_sent = p.report_seq,
+                .frames_received = got,
+                .outstanding = if (lead > p.plans) lead - p.plans else 0,
+                .since_lockstep_s = if (lockstep != 0 and p.plans >= lead) @as(f64, @floatFromInt(age_ns)) / 1e9 else if (lockstep == 0) null else @as(f64, @floatFromInt(sock.nowNs() -| lockstep)) / 1e9,
+            };
+            if (s1 & 1 == 0 and s2 == s1) return snap;
+            if (spins < (1 << 20)) {
+                std.atomic.spinLoopHint();
+                continue;
+            }
+            // The writer never closed this window. Today's writer is the fate thread, and it exits at
+            // its loop's end, never mid-window; this arm covers a writer that does. Hand out the
+            // frozen values with the read counted torn-suspect: the age and the freeze grow on the
+            // reader's clock, so a wedged writer reads as staleness, never as a heal, and no reader
+            // blocks past the spin.
+            snap.bad += 1;
+            return snap;
+        }
+    }
+
+    /// The writer, the fate thread only. Zig 0.17 has no standalone fence, so the marker pair carries them:
+    /// the marker is a COUNTER and each step is a `fetchAdd(1)` — a seq_cst RMW is a full barrier, so this
+    /// rank's field stores cannot land before the odd marker. A bare `.release`/`.acquire` pair on a 0/1
+    /// flag would leave the stores free to land before the marker, and a completed write invisible to a
+    /// reader that checked the flag twice. On GB10's weak ordering, in the serving build's `.fast`, that
+    /// accepts a torn snapshot as undivided and nothing traps.
+    fn storeProgress(f: *Fate, peer: u32, p: Progress, at: u64) void {
+        const s = &f.prog[peer];
+        _ = s.frames_stored.fetchAdd(1, .monotonic);
+        const prev = s.report_seq.load(.monotonic);
+        if (prev != 0 and p.report_seq > prev + 1) _ = s.gaps.fetchAdd(p.report_seq - prev - 1, .monotonic);
+        const sent = if (f.leader_src) |src| src.read(src.ctx) else s.leader_sent.load(.monotonic);
+        _ = s.seq.fetchAdd(1, .seq_cst); // opens the window: s0 + 1, odd
+        s.plans.store(p.plans, .monotonic);
+        s.doorbell.store(p.doorbell, .monotonic);
+        s.completed.store(p.completed, .monotonic);
+        s.proxy_seq.store(p.proxy_seq, .monotonic);
+        s.frozen_ns.store(p.frozen_ns, .monotonic);
+        s.report_seq.store(p.report_seq, .monotonic);
+        s.fault_seq.store(p.fault_seq, .monotonic);
+        s.waited_us.store(p.waited_us, .monotonic);
+        s.peer_flag0.store(p.peer_flags[0], .monotonic);
+        s.peer_flag1.store(p.peer_flags[1], .monotonic);
+        s.small.store(
+            @intCast(@as(u32, @backingInt(p.transport)) | (@as(u32, @truncate(@backingInt(p.fault_why))) << 8) |
+                (@as(u32, @intFromBool(p.faulted)) << 16) | (@as(u32, @intFromBool(p.proxy_failed)) << 17) |
+                (@as(u32, @intFromBool(p.aborted)) << 18) | (@as(u32, @intFromBool(p.link_idle)) << 19)),
+            .monotonic,
+        );
+        s.leader_sent.store(sent, .monotonic);
+        s.at.store(at, .monotonic);
+        _ = s.seq.fetchAdd(1, .release); // closes the window: s0 + 2, even — the counter never returns to
+        // a value a reader that started earlier has already validated, so a completed write always divides it
+        if (p.plans >= sent) s.lockstep_at.store(at, .monotonic); // plans against plans, the same unit
+    }
+
+    /// Test hook: opens peer `peer`'s window and never closes it, so a reader faces a writer killed
+    /// mid-window. The reader's answer is a counted torn-suspect read, never a blocked caller.
+    pub fn wedgeProgressSlot(f: *Fate, peer: u32) void {
+        _ = f.prog[peer].seq.fetchAdd(1, .seq_cst);
+    }
+
     pub fn reason(f: *const Fate) []const u8 {
         return f.reason_buf[0..f.reason_len];
     }
@@ -348,6 +572,33 @@ pub const Fate = struct {
             f.peer_mem_at[peer].store(sock.nowNs(), .release);
             return true;
         }
+        // Telemetry, and the only branch that keeps reading: a progress frame that will not parse is counted
+        // and dropped, never fatal (a broken report has no business killing a serving pair, while control
+        // frames keep dying it). It lands before the fail fallthrough below, which would consume the payload
+        // as a reason and end the ranks. The payload is drained whatever its declared size, so a refused frame
+        // leaves the stream aligned: an unaligned stream hits the magic check, which stays fatal, so a
+        // telemetry bug could heal a healthy pair — the exact false heal this channel exists to close.
+        if (h.kind == kind_progress) {
+            const s = &f.prog[peer];
+            const declared: usize = @intCast(std.math.clamp(h.value, 0, 4096));
+            var raw: [wire_bytes]u8 align(@alignOf(ProgressWire)) = @splat(0); // bytesToValue reads the
+            // wire's own fields out of this buffer: the alignment is part of that contract
+            sock.recvExact(fd, raw[0..@min(declared, wire_bytes)], deadline) catch {
+                _ = s.bad.fetchAdd(1, .monotonic);
+                return true;
+            };
+            drain(fd, declared -| @min(declared, wire_bytes), deadline);
+            if (declared != wire_bytes) {
+                _ = s.bad.fetchAdd(1, .monotonic);
+                return true;
+            }
+            const p = decode(std.mem.bytesToValue(ProgressWire, raw[0..wire_bytes])) orelse {
+                _ = s.bad.fetchAdd(1, .monotonic);
+                return true;
+            };
+            f.storeProgress(peer, p, sock.nowNs());
+            return true;
+        }
         var text: [512]u8 = undefined;
         const len: usize = @intCast(std.math.clamp(h.value, 0, text.len));
         sock.recvExact(fd, text[0..len], deadline) catch {};
@@ -391,17 +642,103 @@ pub const Fate = struct {
         }
     }
 
-    /// One MEM frame, never blocking (a full buffer drops it: the next comes one period later).
+    /// One MEM frame, never blocking (a full buffer drops it: the next comes one period later), then the
+    /// rank's progress as ONE send of the whole 112-byte frame: a split send can land a header and drop its
+    /// payload, and the reader would then parse the payload bytes as a header. The lock spans both sends —
+    /// `die` and `announceStop` send their control frames on this same socket under it, and a frame
+    /// interleaved with a FAIL header lands on the reader's magic check, which is fatal.
     fn report(f: *Fate, fd: sock.Fd) void {
         const h: Frame = .{ .magic = magic, .kind = kind_mem, .value = @intCast(f.usable()) };
+        var buf: [@sizeOf(Frame) + wire_bytes]u8 = undefined;
+        const src = f.progress_src;
+        if (src) |s| {
+            var p: Progress = undefined;
+            s.read(s.ctx, &p);
+            const head: Frame = .{ .magic = magic, .kind = kind_progress, .value = wire_bytes };
+            @memcpy(buf[0..@sizeOf(Frame)], std.mem.asBytes(&head));
+            @memcpy(buf[@sizeOf(Frame)..], std.mem.asBytes(&encode(p)));
+        }
         f.lock();
         defer f.unlock();
         _ = sock.trySend(fd, std.mem.asBytes(&h));
+        if (src != null) _ = sock.trySend(fd, &buf);
     }
 };
 
 fn exitNow(code: u8) void {
     std.c._exit(code);
+}
+
+test "the progress slot's snapshots stay consistent while its writer runs" {
+    var f = Fate.init(.{ .world = 2, .rank = 0, .grace_ns = 0, .report_ns = std.time.ns_per_s }, @splat(-1));
+    const Write = struct {
+        fn run(x: *Fate) void {
+            var i: u64 = 1;
+            while (i < 200_000) : (i += 1) {
+                // completed lands before doorbell, both at i: any torn mix reads completed > doorbell
+                x.storeProgress(1, .{ .transport = .roce, .plans = i, .doorbell = i, .completed = i, .report_seq = i + 1 }, i);
+            }
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Write.run, .{&f});
+    var reads: u64 = 0;
+    while (reads < 20_000) : (reads += 1) {
+        const s = f.peerProgress(1) orelse continue;
+        std.debug.assert(s.prog.completed <= s.prog.doorbell);
+        std.debug.assert(s.prog.report_seq == s.prog.plans + 1);
+        std.debug.assert(s.prog.transport == .roce);
+    }
+    t.join();
+}
+
+test "the ledger stamps lockstep, names the outstanding gap, and counts a jump as drops" {
+    var f = Fate.init(.{ .world = 2, .rank = 0, .grace_ns = 0, .report_ns = std.time.ns_per_s }, @splat(-1));
+    var sent: u64 = 0;
+    const Lead = struct {
+        fn read(ctx: *anyopaque) u64 {
+            return @as(*u64, @ptrCast(@alignCast(ctx))).*;
+        }
+    };
+    f.leader_src = .{ .ctx = &sent, .read = Lead.read };
+    const first = sock.nowNs();
+    f.storeProgress(1, .{ .transport = .roce, .plans = 7, .report_seq = 1 }, first);
+    const a = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 0), a.outstanding);
+    try std.testing.expect(a.since_lockstep_s != null);
+    sent = 10;
+    f.storeProgress(1, .{ .transport = .roce, .plans = 7, .report_seq = 2 }, sock.nowNs());
+    const b = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 3), b.outstanding);
+    try std.testing.expect(b.since_lockstep_s != null and b.since_lockstep_s.? >= a.since_lockstep_s.?);
+    sent = 40;
+    f.storeProgress(1, .{ .transport = .roce, .plans = 7, .report_seq = 3 }, sock.nowNs());
+    const c = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 33), c.outstanding);
+    try std.testing.expectEqual(@as(u64, 0), c.gaps);
+    // reports outrun the leader's plans on a healthy busy pair (two reports a second, plans a few a round):
+    // lockstep is plans against plans, so a growing report count must never stamp the pair back into lockstep
+    sent = 12;
+    var tick: u64 = 4;
+    while (tick <= 13) : (tick += 1) f.storeProgress(1, .{ .transport = .roce, .plans = 7, .report_seq = tick }, sock.nowNs());
+    const g = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 5), g.outstanding);
+    try std.testing.expect(g.since_lockstep_s != null and g.since_lockstep_s.? >= c.since_lockstep_s.?);
+    f.storeProgress(1, .{ .transport = .roce, .plans = 8, .report_seq = 17 }, sock.nowNs());
+    const d = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 3), d.gaps);
+    try std.testing.expectEqual(@as(u64, 8), d.prog.plans);
+}
+
+test "a writer killed mid-window ages out as staleness, and the read is counted torn-suspect" {
+    var f = Fate.init(.{ .world = 2, .rank = 0, .grace_ns = 0, .report_ns = std.time.ns_per_s }, @splat(-1));
+    f.storeProgress(1, .{ .transport = .roce, .plans = 7, .report_seq = 1 }, sock.nowNs());
+    const before = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 0), before.bad);
+    f.wedgeProgressSlot(1);
+    const after = f.peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 1), after.bad);
+    try std.testing.expectEqual(before.prog.plans, after.prog.plans);
+    try std.testing.expect(after.age_ns >= before.age_ns);
 }
 
 /// MemAvailable from /proc/meminfo in bytes (0 when unreadable).
