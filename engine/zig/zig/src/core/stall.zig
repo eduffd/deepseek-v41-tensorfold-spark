@@ -5,14 +5,19 @@ const std = @import("std");
 
 pub const exit_code: u8 = 70;
 
-/// The engine thread's round sections, in order.
-pub const Phase = enum(u8) { idle, admit, plan, pieces, finals, decode, deliver, after };
+/// The engine thread's round sections, in order. `plan_wait`/`replay` are the follower's side of a round: waiting
+/// on the leader's plan frame, then running the operations it carried.
+pub const Phase = enum(u8) { idle, admit, plan, pieces, finals, decode, deliver, after, plan_wait, replay };
 
 pub const Settings = struct {
     rank: u32 = 0,
     limit_s: f64 = 300, // TF_DSV41_STALL_S: first report; 0 = no report
     exit_s: f64 = 0, // TF_DSV41_STALL_EXIT_S: exit 70; 0 = never
     poll_ns: u64 = std.time.ns_per_s,
+    /// The names the report and the exit line quote. A follower's watch runs on the peer-wait knob, not the stall
+    /// pair, and a report that names the wrong knob sends the operator to the wrong setting.
+    limit_knob: []const u8 = "TF_DSV41_STALL_S",
+    exit_knob: []const u8 = "TF_DSV41_STALL_EXIT_S",
 
     pub const off: Settings = .{ .limit_s = 0, .exit_s = 0 };
 
@@ -32,6 +37,7 @@ pub const Watch = struct {
     settings: Settings,
     sink: Sink = .{},
     exit_fn: *const fn (u8) void = exitNow, // fate.zig's seam: tests replace it (it may return there)
+    exit_hook: ?ExitHook = null, // a ctx seam run instead of it: the pair routes its exit through the peer layer
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false), // closer writes
     exited: std.atomic.Value(bool) = .init(false), // watch thread writes
@@ -47,6 +53,10 @@ pub const Watch = struct {
     finals: std.atomic.Value(u32) = .init(0),
     seen_round: u64 = std.math.maxInt(u64), // watch thread only
     last_report: u64 = 0, // watch thread only
+
+    /// A ctx seam run in place of `exit_fn` when a round passes the exit knob: the serving pair routes the exit
+    /// through its peer layer, so the other rank hears the reason and not only a socket close.
+    pub const ExitHook = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, code: u8) void };
 
     pub fn init(io: std.Io, settings: Settings) Watch {
         return .{ .io = io, .settings = settings };
@@ -135,7 +145,7 @@ pub const Watch = struct {
         }
         w.exitLine(now, rnd, t_round);
         w.exited.store(true, .release);
-        w.exit_fn(exit_code);
+        if (w.exit_hook) |h| h.run(h.ctx, exit_code) else w.exit_fn(exit_code);
         return true;
     }
 
@@ -150,12 +160,13 @@ pub const Watch = struct {
         const p: Phase = @fromBackingInt(@intCast(w.current.load(.acquire)));
         const t_phase = w.t_phase.load(.acquire);
         var buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} has run {d:.1} s (phase '{s}' for {d:.1} s; TF_DSV41_STALL_S={d})\n  host: {d} running, {d} waiting; plan {d} pieces, {d} finals\n", .{
+        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} has run {d:.1} s (phase '{s}' for {d:.1} s; {s}={d})\n  host: {d} running, {d} waiting; plan {d} pieces, {d} finals\n", .{
             w.settings.rank,
             rnd,
             nsToSeconds(now -| t_round),
             @tagName(p),
             nsToSeconds(now -| t_phase),
+            w.settings.limit_knob,
             w.settings.limit_s,
             w.running.load(.acquire),
             w.waiting.load(.acquire),
@@ -168,10 +179,11 @@ pub const Watch = struct {
 
     fn exitLine(w: *Watch, now: u64, rnd: u64, t_round: u64) void {
         var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} ran {d:.0} s >= TF_DSV41_STALL_EXIT_S={d}: exiting ({d}) so the watchdog restarts both ranks\n", .{
+        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} ran {d:.0} s >= {s}={d}: exiting ({d}) so the watchdog restarts both ranks\n", .{
             w.settings.rank,
             rnd,
             nsToSeconds(now -| t_round),
+            w.settings.exit_knob,
             w.settings.exit_s,
             exit_code,
         }) catch return;

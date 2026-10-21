@@ -351,7 +351,10 @@ pub const Model = struct {
         const ehb = try cwd.readFileAllocOptions(io, try std.fs.path.join(a, &.{ assets, "engram-host.bin" }), a, .limited(1 << 26), .@"4", null);
         m.host = try eh.Host.load(ehb, m.cfg.engram_heads, m.cfg.engram_pad, m.cfg.engram_vocab, &m.lbuf);
         m.f.engram = &m.host;
-        if (world > 1) m.f.link = &m.session.plan;
+        if (world > 1) {
+            m.f.link = &m.session.plan;
+            m.f.tp_session = &m.session; // the peer-wait clock's round bracket (forward.roundOpen / follow's markers)
+        }
         m.f.on_stop = .{ .ctx = &m.session, .run = announceStop };
         const so = try sg.optionsFromEnv();
         const several_ok = m.slots == 1 or so.several;

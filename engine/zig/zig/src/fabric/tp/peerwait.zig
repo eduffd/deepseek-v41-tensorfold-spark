@@ -218,17 +218,39 @@ pub const Clock = struct {
     pub fn expire(c: *Clock, cause0: Cause) bool {
         if (c.settings.silence_ns == 0) return false;
         if (c.expired_flag.swap(true, .acq_rel)) return false;
-        var filled = cause0;
-        filled.fill(c.settings.rank, c.round_no.load(.monotonic), @as(f64, @floatFromInt(c.boundNs())) / 1e9);
         var sbuf: [448]u8 = undefined;
-        const sentence = filled.format(&sbuf) catch "peer wait expired";
-        c.report(sentence);
+        const sentence = c.speak(cause0, &sbuf);
         if (!c.armed.load(.acquire)) {
             c.expired_flag.store(false, .release);
             return false;
         }
-        if (c.fate) |f| f.fatal(sentence, error.PeerStalled) else c.exit_fn(fate.exit_code);
+        c.down(sentence);
         return true;
+    }
+
+    /// An expiry a witness saw from outside the silence (a follower's round watch, a proxy's in-flight bound): the
+    /// same one latch and the same named line, no `armed` gate: the witness stands on its own evidence.
+    pub fn fault(c: *Clock, cause0: Cause) bool {
+        if (c.settings.silence_ns == 0) return false;
+        if (c.expired_flag.swap(true, .acq_rel)) return false;
+        var sbuf: [448]u8 = undefined;
+        c.down(c.speak(cause0, &sbuf));
+        return true;
+    }
+
+    /// Fill what the wait site could not know, render the sentence, print the named line.
+    fn speak(c: *Clock, cause0: Cause, buf: []u8) []const u8 {
+        var filled = cause0;
+        filled.fill(c.settings.rank, c.round_no.load(.monotonic), @as(f64, @floatFromInt(c.boundNs())) / 1e9);
+        const sentence = filled.format(buf) catch "peer wait expired";
+        c.report(sentence);
+        return sentence;
+    }
+
+    /// The exit this rank's fault route takes: Fate with the named reason (the FAIL frame carries it to the peer),
+    /// or the bare 70 where fail-fast is off.
+    fn down(c: *Clock, sentence: []const u8) void {
+        if (c.fate) |f| f.fatal(sentence, error.PeerStalled) else c.exit_fn(fate.exit_code);
     }
 
     fn report(c: *Clock, sentence: []const u8) void {

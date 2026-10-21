@@ -184,6 +184,9 @@ pub const Served = struct {
         s.host.graphs = .{ .read = readGraphs };
         // /health's "peer": rank 1's transport counters, read from the fate channel's lock-free snapshot
         s.host.peer = .{ .ctx = m, .read = readPeer };
+        // TF_DSV41_PEER_WAIT_S: rank 0's round bracket on the plan stream, on the host's own stamps. Off the knob
+        // the host carries no hook at all, so the plan stream is exactly what it was.
+        if (m.session.cfg.peer_wait_ns > 0) s.host.on_round = .{ .ctx = m, .begin = roundOpen, .end = roundClose };
         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
         s.sched = null;
@@ -222,6 +225,18 @@ pub const Served = struct {
     fn syncStream(ctx: *anyopaque) anyerror!void {
         const m: *model.Model = @ptrCast(@alignCast(ctx));
         try m.stream.synchronize();
+    }
+
+    /// The peer-wait round bracket, opened and closed on the host's stamps: `round_open` before the round's frames,
+    /// `round_close` at its boundary (forward.roundOpen / roundClose, where the plan frames go out).
+    fn roundOpen(ctx: *anyopaque, round_no: u64, rows: u64) void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        m.f.roundOpen(round_no, rows);
+    }
+
+    fn roundClose(ctx: *anyopaque) void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        m.f.roundClose();
     }
 
     fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
