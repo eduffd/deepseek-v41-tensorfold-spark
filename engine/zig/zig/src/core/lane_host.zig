@@ -95,6 +95,7 @@ pub const LaneHost = struct {
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     graphs: ?api.GraphsSource = null, // the backend's graph caches for /health; null: none
+    peer: ?api.PeerSource = null, // the backend's peer-progress hook; null: /health shows no peer
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
     on_thread: ?ThreadInit = null,
