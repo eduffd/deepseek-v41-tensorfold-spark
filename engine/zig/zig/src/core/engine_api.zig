@@ -193,6 +193,54 @@ pub const GraphsSource = struct {
     read: *const fn (ctx: ?*anyopaque, out: []GraphStatus) usize,
 };
 
+/// The transport a peer's counters come from, mirroring the tp runtime's collective kinds.
+pub const PeerTransport = enum { nccl, mailbox, hybrid, roce, host };
+/// How a peer's failed wait ended; `none` means no fault. `unknown`: the wire said a fault with a why no reader knows.
+pub const PeerFault = enum { none, abort, timeout, unknown };
+
+/// Rank 0's read of a peer rank's last progress report. Counters are cumulative since that rank's boot;
+/// a watchdog derives deltas from consecutive polls. Plain values read from the channel's lock-free
+/// snapshot: filling them touches no GPU call and takes no lock.
+pub const PeerProgress = struct {
+    /// seconds since the peer's newest report (a dropped frame ages it out: staleness is a fact, never a stall)
+    age_s: f64 = 0,
+    /// names what the zero counters mean: no doorbell words on nccl
+    transport: PeerTransport = .nccl,
+    plans: u64 = 0,
+    doorbell: u64 = 0,
+    completed: u64 = 0,
+    proxy_seq: u64 = 0,
+    /// the peer's counters have not moved for this long, its age included: a dropped report lengthens it,
+    /// so a wedged peer can never be made to look healthy by a full socket buffer
+    frozen_s: f64 = 0,
+    /// reports the socket buffer dropped
+    gaps: u64 = 0,
+    /// reports the boundary parse refused
+    bad: u64 = 0,
+    frames_sent: u64 = 0,
+    frames_received: u64 = 0,
+    /// plans rank 0 has sent that the peer has not read: a wedge's size, 0 in lockstep
+    outstanding: u64 = 0,
+    /// seconds since the pair last kept pace; null: never reported in lockstep
+    since_lockstep_s: ?f64 = null,
+    faulted: bool = false,
+    fault_seq: u64 = 0,
+    fault_why: PeerFault = .none,
+    waited_us: u64 = 0,
+    proxy_failed: bool = false,
+    aborted: bool = false,
+    link_idle: bool = false,
+    /// the peer's view of rank 0's doorbell (a half-wedge seen from the other side)
+    peer_flags: [2]u64 = .{ 0, 0 },
+};
+
+/// A backend's peer-progress hook for LaneHost; read from HTTP threads, so it takes no lock and touches no GPU.
+pub const PeerSource = struct {
+    ctx: ?*anyopaque = null,
+    /// fills `out` with the peer's newest report; false: the peer has never reported
+    read: *const fn (ctx: ?*anyopaque, out: *PeerProgress) bool,
+};
+
 pub const Status = struct {
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,
@@ -213,6 +261,8 @@ pub const Status = struct {
     /// The backend's graph caches, the first `graph_caches` of them (0: it keeps none).
     graphs: [4]GraphStatus = @splat(.{}),
     graph_caches: u8 = 0,
+    /// a peer rank's transport progress (null: the engine wires none, or the peer never reported)
+    peer: ?PeerProgress = null,
 };
 
 pub const PaceStatus = struct {

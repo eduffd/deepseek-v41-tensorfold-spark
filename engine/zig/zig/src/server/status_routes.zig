@@ -28,6 +28,37 @@ fn queueFields(a: Allocator, o: *json.Object, st: api.Status) Allocator.Error!vo
         }
         try o.put(a, "graphs", .{ .object = g });
     }
+    // a peer's transport facts, never a verdict: a half-wedge is a 200 with a growing frozen_s. The peer
+    // object is keyed only when the engine wires a peer and it has reported (fail-fast off shows none).
+    if (st.peer) |pp| {
+        const x = try json.newObject(a);
+        try x.put(a, "age_s", .{ .float = spark.round(pp.age_s, 1) });
+        try x.put(a, "frozen_s", .{ .float = spark.round(pp.frozen_s, 1) });
+        try x.put(a, "transport", .{ .string = @tagName(pp.transport) });
+        try x.put(a, "plans", try json.intValue(a, pp.plans));
+        try x.put(a, "doorbell", try json.intValue(a, pp.doorbell));
+        try x.put(a, "completed", try json.intValue(a, pp.completed));
+        try x.put(a, "proxy_seq", try json.intValue(a, pp.proxy_seq));
+        try x.put(a, "gaps", try json.intValue(a, pp.gaps));
+        try x.put(a, "bad", try json.intValue(a, pp.bad));
+        try x.put(a, "frames_sent", try json.intValue(a, pp.frames_sent));
+        try x.put(a, "frames_received", try json.intValue(a, pp.frames_received));
+        try x.put(a, "outstanding", try json.intValue(a, pp.outstanding));
+        try x.put(a, "since_lockstep_s", if (pp.since_lockstep_s) |v| .{ .float = spark.round(v, 1) } else .null);
+        if (pp.faulted) {
+            try x.put(a, "fault_seq", try json.intValue(a, pp.fault_seq));
+            try x.put(a, "fault_why", .{ .string = @tagName(pp.fault_why) });
+            try x.put(a, "waited_us", try json.intValue(a, pp.waited_us));
+        }
+        try x.put(a, "proxy_failed", .{ .bool = pp.proxy_failed });
+        try x.put(a, "aborted", .{ .bool = pp.aborted });
+        try x.put(a, "link_idle", .{ .bool = pp.link_idle });
+        const flags = try a.alloc(Value, 2);
+        flags[0] = try json.intValue(a, pp.peer_flags[0]);
+        flags[1] = try json.intValue(a, pp.peer_flags[1]);
+        try x.put(a, "flags", .{ .array = flags });
+        try o.put(a, "peer", .{ .object = x });
+    }
     const p = st.pace orelse return;
     const x = try json.newObject(a);
     try x.put(a, "last_age_s", if (p.last_round_age_s) |v| .{ .float = spark.round(v, 1) } else .null);
@@ -56,8 +87,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
         const r = try h.status(a, streams, srv.info.context_window);
         if (!drain) {
             try queueFields(a, r.body.object, st);
-            const inflight = if (r.body.object.get("inflight")) |v| @as(usize, @intCast(v.int64() orelse 0)) else 0;
-            if (try h.stuck(a, st, inflight)) |why| {
+            if (try h.stuck(a, st, r)) |why| {
                 // the watchdog's restart signal: the engine is stuck, not merely busy
                 try r.body.object.put(a, "ok", .{ .bool = false });
                 try r.body.object.put(a, "status", .{ .string = "stalled" });
@@ -115,7 +145,11 @@ pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
 /// Prometheus text, version 0.0.4.
 pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
     var out: std.Io.Writer.Allocating = .init(a);
-    if (srv.health) |h| h.metrics(&out.writer, srv.config.served_name) catch return else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
+    if (srv.health) |h| {
+        var st: api.Status = .{};
+        srv.engine.status(&st, &.{});
+        h.metrics(&out.writer, srv.config.served_name, st.peer) catch return;
+    } else srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
     const body = out.written();
     conn.startResponse(200, null) catch return;
     conn.addHeader("Content-Type", if (srv.health != null) "text/plain; version=0.0.4" else "text/plain; version=0.0.4; charset=utf-8") catch return;
@@ -182,6 +216,52 @@ test "stats snapshot exposes counters and omits unknown memory" {
     for ([_][]const u8{ "running", "waiting", "generation_tokens_running", "prompt_tokens_total", "generation_tokens_total", "mtp_drafted_total", "mtp_accepted_total", "decode_rounds_total", "memory" }) |key|
         try std.testing.expect(object.contains(key));
     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+}
+
+test "health: a peer's facts render by name, its fault only when a fault landed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st: api.Status = .{ .peer = .{
+        .age_s = 0.6,
+        .transport = .roce,
+        .plans = 7,
+        .doorbell = 4,
+        .completed = 3,
+        .frozen_s = 1.1,
+        .gaps = 2,
+        .bad = 1,
+        .frames_sent = 9,
+        .frames_received = 7,
+        .outstanding = 3,
+        .since_lockstep_s = 12.5,
+        .proxy_failed = true,
+        .link_idle = true,
+        .peer_flags = .{ 5, 0 },
+    } };
+    const o = try json.newObject(a);
+    try queueFields(a, o, st);
+    const p = o.get("peer").?.object;
+    try std.testing.expectEqual(@as(f64, 0.6), p.get("age_s").?.float);
+    try std.testing.expectEqualStrings("roce", p.get("transport").?.string);
+    try std.testing.expectEqual(@as(?i64, 3), p.get("outstanding").?.int64());
+    try std.testing.expectEqual(@as(?i64, 2), p.get("gaps").?.int64());
+    try std.testing.expectEqual(@as(f64, 12.5), p.get("since_lockstep_s").?.float);
+    try std.testing.expect(!p.contains("fault_why"));
+    try std.testing.expect(p.get("proxy_failed").?.bool);
+    try std.testing.expect(!p.get("aborted").?.bool);
+    st.peer.?.faulted = true;
+    st.peer.?.fault_seq = 11;
+    st.peer.?.fault_why = .timeout;
+    st.peer.?.waited_us = 4_000_000;
+    const w = try json.newObject(a);
+    try queueFields(a, w, st);
+    const q = w.get("peer").?.object;
+    try std.testing.expectEqualStrings("timeout", q.get("fault_why").?.string);
+    try std.testing.expectEqual(@as(?i64, 11), q.get("fault_seq").?.int64());
+    const none = try json.newObject(a);
+    try queueFields(a, none, .{});
+    try std.testing.expect(!none.contains("peer"));
 }
 
 test "health: each graph cache's counts and floor state, by name" {

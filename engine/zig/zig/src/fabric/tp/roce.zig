@@ -5,6 +5,7 @@ const collective = @import("collective.zig");
 const Bootstrap = @import("bootstrap.zig").Bootstrap;
 const sock = @import("sock.zig");
 const rv = @import("roce_verbs.zig");
+const fate = @import("fate.zig");
 const HostRegister = @import("mailbox.zig").HostRegister;
 const posix = std.posix;
 const DevicePtr = collective.DevicePtr;
@@ -160,7 +161,9 @@ pub const Roce = struct {
     // the proxy thread
     thread: ?std.Thread = null,
     running: std.atomic.Value(bool) = .init(false),
-    last_seq: u32 = 0,
+    /// The last sequence the proxy posted. Written by the proxy thread alone; read by `check` and the progress
+    /// sampler on the serving threads, so it is atomic (a plain u32 read across threads is a data race).
+    last_seq: std.atomic.Value(u32) = .init(0),
     err_buf: [160]u8 = undefined,
     err_len: usize = 0,
     // host emulation of the kernel's side (tests)
@@ -389,16 +392,17 @@ pub const Roce = struct {
         while (r.running.load(.monotonic)) {
             if (r.word(w_abort).load(.monotonic) != 0) return;
             const seq = r.word(w_seq).load(.acquire);
-            if (seq == r.last_seq) {
+            if (seq == r.last_seq.load(.monotonic)) {
                 idle += 1;
                 if (idle % 64 == 0) r.wire.reap() catch |e| return r.fail("completion: {t}", .{e});
                 if (idle >= idle_spins) sock.sleepNs(20 * std.time.ns_per_us) else std.atomic.spinLoopHint();
                 continue;
             }
             idle = 0;
-            var pending = seq -% r.last_seq;
-            if (pending > 2) return r.fail("doorbell skipped {d} ops (posted {d}, now {d})", .{ pending, r.last_seq, seq });
-            var s = r.last_seq +% 1;
+            const posted = r.last_seq.load(.monotonic);
+            var pending = seq -% posted;
+            if (pending > 2) return r.fail("doorbell skipped {d} ops (posted {d}, now {d})", .{ pending, posted, seq });
+            var s = posted +% 1;
             while (pending > 0) : ({
                 s +%= 1;
                 pending -= 1;
@@ -406,7 +410,7 @@ pub const Roce = struct {
                 const padded = r.word(w_slot_bytes + (s & 1)).load(.acquire);
                 if (padded == 0 or padded % 16 != 0 or padded > r.slot_bytes) return r.fail("op {d} of {d} bytes", .{ s, padded });
                 r.wire.post(s & 1, s, padded) catch |e| return r.fail("post of op {d}: {t}", .{ s, e });
-                r.last_seq = s;
+                r.last_seq.store(s, .release);
             }
             r.wire.reap() catch |e| return r.fail("completion: {t}", .{e});
         }
@@ -437,7 +441,7 @@ pub const Roce = struct {
             .slot_bytes = r.slot_bytes,
             .timeout_ns = r.timeout_ns,
             .rank = r.me,
-            .mode = @intFromEnum(mode),
+            .mode = @backingInt(mode),
             .n_hca = r.wire.hcas(),
             .opts = r.fast,
             .lens = lens,
@@ -501,11 +505,47 @@ pub const Roce = struct {
 
     pub fn check(r: *Roce) Error!void {
         if (r.word(w_failed).load(.acquire) != 0) {
-            std.log.warn("tp roce: rank {d}'s wait for seq {d} failed ({s} after {d} us; HCA {d}, flag held {d}); doorbell {d}, posted {d}, completed {d}, abort {d}, proxy failed {d}, flags {d} {d}", .{ r.me, r.word(w_failed + 1).load(.acquire), if (r.word(w_failed + 4).load(.acquire) == 1) "aborted" else "timed out", r.word(w_failed + 5).load(.acquire), r.word(w_failed + 3).load(.acquire), r.word(w_failed + 2).load(.acquire), r.word(w_seq).load(.acquire), r.last_seq, r.word(w_completed).load(.acquire), r.word(w_abort).load(.acquire), r.word(w_proxy_failed).load(.acquire), r.flagWord(0), r.flagWord(1) });
+            std.log.warn("tp roce: rank {d}'s wait for seq {d} failed ({s} after {d} us; HCA {d}, flag held {d}); doorbell {d}, posted {d}, completed {d}, abort {d}, proxy failed {d}, flags {d} {d}", .{ r.me, r.word(w_failed + 1).load(.acquire), if (r.word(w_failed + 4).load(.acquire) == 1) "aborted" else "timed out", r.word(w_failed + 5).load(.acquire), r.word(w_failed + 3).load(.acquire), r.word(w_failed + 2).load(.acquire), r.word(w_seq).load(.acquire), r.last_seq.load(.acquire), r.word(w_completed).load(.acquire), r.word(w_abort).load(.acquire), r.word(w_proxy_failed).load(.acquire), r.flagWord(0), r.flagWord(1) });
             return error.PeerFailed;
         }
         if (r.word(w_proxy_failed).load(.acquire) != 0) return error.BackendFailed;
         if (r.aborted.load(.acquire) or r.word(w_abort).load(.acquire) != 0) return error.Aborted;
+    }
+
+    /// `check`'s words as a snapshot: the same loads, no log, no error, no side effect. The progress
+    /// sampler's source, from a thread that must not touch a GPU call, a lock, or the allocator.
+    pub const RoceProgress = struct {
+        doorbell: u64,
+        completed: u64,
+        /// the seq the proxy posted last
+        proxy_seq: u64,
+        faulted: bool,
+        fault_seq: u64,
+        fault_why: fate.FaultWhy,
+        waited_us: u64,
+        proxy_failed: bool,
+        aborted: bool,
+        link_idle: bool,
+        /// this rank's view of the leader's doorbell, per HCA (a half-wedge seen from the other side)
+        flags: [2]u64,
+    };
+
+    pub fn progress(r: *const Roce) RoceProgress {
+        const hit = r.word(w_failed).load(.acquire) != 0;
+        return .{
+            .doorbell = r.word(w_seq).load(.acquire),
+            .completed = r.word(w_completed).load(.acquire),
+            .proxy_seq = r.last_seq.load(.acquire),
+            .faulted = hit,
+            .fault_seq = r.word(w_failed + 1).load(.acquire),
+            // the reading `check` gives this word: 1 is an abort of the wait, anything else its timeout
+            .fault_why = if (hit) if (r.word(w_failed + 4).load(.acquire) == 1) .abort else .timeout else .none,
+            .waited_us = r.word(w_failed + 5).load(.acquire),
+            .proxy_failed = r.word(w_proxy_failed).load(.acquire) != 0,
+            .aborted = r.aborted.load(.acquire) or r.word(w_abort).load(.acquire) != 0,
+            .link_idle = r.linkIdle(),
+            .flags = .{ r.flagWord(0), r.flagWord(1) },
+        };
     }
 
     fn flagWord(r: *const Roce, slot: usize) u32 {
