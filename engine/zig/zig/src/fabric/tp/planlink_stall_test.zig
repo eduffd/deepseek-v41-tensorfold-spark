@@ -93,7 +93,7 @@ test "a leader's plan a peer stopped reading is PeerStalled before the count mov
     var cap: CauseCap = .{};
     p.lead.deadline_src = .{ .ctx = &cl, .call = Clocked.deadline };
     p.lead.on_deadline = .{ .ctx = &cap, .call = CauseCap.call };
-    const big = try std.testing.alloc(i64, 1 << 20); // 8 MiB, far past what the pair's buffers hold
+    const big = try std.testing.allocator.alloc(i64, 1 << 20); // 8 MiB, far past what the pair's buffers hold
     defer std.testing.allocator.free(big);
     @memset(big, 7);
     try std.testing.expectError(error.PeerStalled, p.lead.send(big));

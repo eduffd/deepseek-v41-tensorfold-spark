@@ -241,6 +241,15 @@ pub const PeerSource = struct {
     read: *const fn (ctx: ?*anyopaque, out: *PeerProgress) bool,
 };
 
+/// The round bracket LaneHost stamps, one open and one close per round: the family seam sends the round's peer
+/// markers here (LaneHost never holds a Forward), and `rows` is what the round admitted, the allowance a waiting
+/// peer derives.
+pub const RoundHooks = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque, round_no: u64, rows: u64) void,
+    end: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Status = struct {
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,

@@ -108,12 +108,27 @@ fn waitWritable(fd: Fd, deadline_ns: u64) Error!void {
 /// (null: no deadline, forever). A peer that died is Closed and one that stopped reading is Timeout: the
 /// departure and the wedge stay distinguishable, and a partial write that later stalls is the wedge.
 pub fn sendAll(fd: Fd, bytes: []const u8, deadline_ns: ?u64) Error!void {
+    return sendFlagged(fd, bytes, posix.MSG.NOSIGNAL, deadline_ns);
+}
+
+/// `sendAll` with the send flags chosen by the caller (planlink keeps MSG_MORE on a frame's length word).
+pub fn sendFlagged(fd: Fd, bytes: []const u8, flags: u32, deadline_ns: ?u64) Error!void {
     var off: usize = 0;
     while (off < bytes.len) {
         if (deadline_ns) |d| try waitWritable(fd, d);
-        const n = c.send(fd, bytes[off..].ptr, bytes.len - off, posix.MSG.NOSIGNAL);
+        // a bounded wait has to bound the send itself too: `poll` says the socket takes *some* of a big frame, and a
+        // blocking `send` then sits in the kernel until the whole buffer is accepted, which a peer that stopped
+        // reading never does. MSG_DONTWAIT takes what fits and lets the loop's poll carry the deadline; with no
+        // deadline the send stays blocking, exactly the path this tree had.
+        var f = flags;
+        if (deadline_ns != null) f |= posix.MSG.DONTWAIT;
+        const n = c.send(fd, bytes[off..].ptr, bytes.len - off, f);
         if (n <= 0) {
-            if (n < 0 and posix.errno(n) == .INTR) continue;
+            // .AGAIN is the window being full (EWOULDBLOCK is EAGAIN): the poll above waits for it to drain
+            if (n < 0) switch (posix.errno(n)) {
+                .INTR, .AGAIN => continue,
+                else => {},
+            };
             return error.Closed;
         }
         off += @intCast(n);
@@ -197,7 +212,7 @@ test "a send past a peer that stopped reading times out; a peer that died is Clo
     const small: c_int = 8192;
     _ = c.setsockopt(a, posix.SOL.SOCKET, posix.SO.SNDBUF, &small, @sizeOf(c_int));
     // b never reads: the sockets hold far less than the frame, so the send parks in a full window
-    const big = try std.testing.alloc(u8, 8 << 20);
+    const big = try std.testing.allocator.alloc(u8, 8 << 20);
     defer std.testing.allocator.free(big);
     try std.testing.expectError(error.Timeout, sendAll(a, big, nowNs() + 150 * std.time.ns_per_ms));
     hangup(b);
