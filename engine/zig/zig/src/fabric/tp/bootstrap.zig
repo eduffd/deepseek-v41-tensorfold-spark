@@ -46,7 +46,7 @@ pub const Bootstrap = struct {
                 const fd = try sock.connect(cfg.master, cfg.link_port, until);
                 if (role == 0) b.fds[0] = fd else b.plan_fds[0] = fd;
                 const h: Hello = .{ .magic = magic, .version = version, .world = cfg.world, .rank = cfg.rank, .role = role };
-                try sock.sendAll(fd, std.mem.asBytes(&h));
+                try sock.sendAll(fd, std.mem.asBytes(&h), null);
             }
         }
         return b;
@@ -179,8 +179,8 @@ pub const Bootstrap = struct {
 
 fn sendFrame(fd: sock.Fd, bytes: []const u8) sock.Error!void {
     const l: u32 = @intCast(bytes.len);
-    try sock.sendAll(fd, std.mem.asBytes(&l));
-    try sock.sendAll(fd, bytes);
+    try sock.sendAll(fd, std.mem.asBytes(&l), null);
+    try sock.sendAll(fd, bytes, null);
 }
 
 /// An ephemeral listening port for tests.

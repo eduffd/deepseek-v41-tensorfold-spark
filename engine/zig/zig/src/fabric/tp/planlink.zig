@@ -50,7 +50,7 @@ pub const PlanLink = struct {
         const len: u32 = @intCast(bytes.len);
         for (p.fds[1..p.world]) |fd| {
             if (std.c.send(fd, &len, 4, std.posix.MSG.NOSIGNAL | more) != 4) return error.PeerClosed;
-            sock.sendAll(fd, bytes) catch return error.PeerClosed;
+            sock.sendAll(fd, bytes, null) catch return error.PeerClosed;
         }
         _ = p.sent.fetchAdd(1, .release);
     }
