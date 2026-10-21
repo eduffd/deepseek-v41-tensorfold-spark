@@ -303,7 +303,10 @@ pub const Health = struct {
             if (p.last_round_age_s) |age| {
                 if (age > h.stall_round_s)
                     return try std.fmt.allocPrint(a, "no round for {d:.0} s with work in flight", .{age});
-            } else if (rep.quiet) |_| {}
+            } else if (rep.quiet) |q| {
+                if (q.quiet_s > q.allowed_s)
+                    return try std.fmt.allocPrint(a, "no round has completed: request quiet {d:.0} s (allow {d:.0} s) with work in flight", .{ q.quiet_s, q.allowed_s });
+            }
         }
         if (h.stall_slow_s > 0 and p.slow_s > h.stall_slow_s)
             return try std.fmt.allocPrint(a, "rounds slower than their baseline for {d:.0} s (decode {d:.3} s vs {d:.3}; prefill {d:.0} vs {d:.0} rows/s)", .{ p.slow_s, p.decode_s, p.decode_base_s, p.prefill_rows_s, p.prefill_base_rows_s });

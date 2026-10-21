@@ -273,6 +273,8 @@ pub const LaneHost = struct {
             .pace = paceStatus(&h.pace, now),
         };
         if (h.graphs) |g| out.graph_caches = @intCast(g.read(g.ctx, &out.graphs));
+        var pp: api.PeerProgress = .{};
+        if (h.peer) |src| out.peer = if (src.read(src.ctx, &pp)) pp else null;
     }
 
     fn oldestQueued(h: *const LaneHost) i96 {
