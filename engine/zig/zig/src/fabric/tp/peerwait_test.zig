@@ -223,7 +223,7 @@ test "one expiry prints one named line, the FAIL frame carries its reason, and a
     c.beginRound(12);
     advance(10_000_000);
     try std.testing.expect(c.tick()); // the silence expired: fatal through rank 1's fate
-    c.expire(.{ .plan_recv = .{ .rank = 1, .round = 12, .allow_s = 0, .received = 0 } }); // idempotent
+    _ = c.expire(.{ .plan_recv = .{ .rank = 1, .round = 12, .allow_s = 0, .received = 0 } }); // idempotent
     try waitExits(2);
     try std.testing.expectEqual(@as(usize, 1), cap.n);
     try std.testing.expect(std.mem.indexOf(u8, cap.at(0), "plan read") != null);
