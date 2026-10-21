@@ -35,6 +35,65 @@ test "a lane host reports its backend's memory counts, and none without them" {
     try std.testing.expectEqual(@as(u32, 1), counts.resets);
 }
 
+test "a lane host shows its backend's peer progress, and none without the hook" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    var st: api.Status = .{};
+    host.engine().status(&st, &.{});
+    try std.testing.expect(st.peer == null);
+    const Peer = struct {
+        fn read(ctx: ?*anyopaque, out: *api.PeerProgress) bool {
+            const p: *api.PeerProgress = @ptrCast(@alignCast(ctx.?));
+            out.* = p.*;
+            return true;
+        }
+    };
+    var peer: api.PeerProgress = .{
+        .age_s = 0.6,
+        .transport = .roce,
+        .plans = 7,
+        .doorbell = 4,
+        .completed = 3,
+        .frozen_s = 1.1,
+        .gaps = 2,
+        .bad = 1,
+        .frames_sent = 9,
+        .frames_received = 7,
+        .outstanding = 3,
+        .since_lockstep_s = 12.5,
+        .faulted = true,
+        .fault_seq = 11,
+        .fault_why = .timeout,
+    };
+    host.peer = .{ .ctx = &peer, .read = Peer.read };
+    var got: api.Status = .{};
+    host.engine().status(&got, &.{});
+    const pp = got.peer orelse return error.NoPeerProgress;
+    try std.testing.expectEqual(@as(f64, 0.6), pp.age_s);
+    try std.testing.expectEqual(api.PeerTransport.roce, pp.transport);
+    try std.testing.expectEqual(@as(u64, 7), pp.plans);
+    try std.testing.expectEqual(@as(u64, 4), pp.doorbell);
+    try std.testing.expectEqual(@as(u64, 3), pp.outstanding);
+    try std.testing.expectEqual(@as(f64, 12.5), pp.since_lockstep_s.?);
+    try std.testing.expectEqual(api.PeerFault.timeout, pp.fault_why);
+    const None = struct {
+        fn read(_: ?*anyopaque, _: *api.PeerProgress) bool {
+            return false;
+        }
+    };
+    host.peer = .{ .read = None.read };
+    var none: api.Status = .{};
+    host.engine().status(&none, &.{});
+    try std.testing.expect(none.peer == null);
+}
+
 test "a request the backend refuses fails alone, in the backend's words" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
