@@ -263,31 +263,56 @@ pub const Health = struct {
 
     const Stalled = struct { prompt: f64, quiet_s: f64, allowed_s: f64 };
 
+    /// One request's quiet allowance: the knob plus the prefill allowance for a request that has delivered
+    /// nothing. Both stall verdicts compare against this number, so a long prefill's legitimacy cannot drift
+    /// between them.
+    fn allowance(e: Entry, base_s: f64, prefill_tps: f64) f64 {
+        var allow = base_s;
+        if (e.tokens == 0 and prefill_tps > 0) allow += e.prompt / prefill_tps;
+        return allow;
+    }
+
+    /// The most-silent in-flight request: its quiet and the allowance that covers it.
+    pub const Quiet = struct { quiet_s: f64, allowed_s: f64 };
+    /// `/health`'s answer with what the stall chain needs from the inflight map, measured under its lock.
+    /// `quiet` is null exactly when nothing is in flight: an idle pair has no evidence, so no verdict.
+    pub const Report = struct {
+        code: u16,
+        body: Value,
+        inflight: usize,
+        quiet: ?Quiet,
+    };
+
     fn stalled(h: *Health, a: Allocator, t: i96) Allocator.Error![]Stalled {
         var out: std.ArrayList(Stalled) = .empty;
         if (h.stall_s <= 0) return out.items;
         for (h.inflight.values()) |e| {
-            var allow = h.stall_s;
-            if (e.tokens == 0 and h.prefill_tps > 0) allow += e.prompt / h.prefill_tps;
+            const allow = allowance(e, h.stall_s, h.prefill_tps);
             const quiet = secs(t - e.last);
             if (quiet > allow) try out.append(a, .{ .prompt = e.prompt, .quiet_s = round(quiet, 1), .allowed_s = round(allow, 1) });
         }
         return out.items;
     }
 
-    /// Why the engine is stuck (no round with work in flight, or a slow pace held too long), or null.
-    pub fn stuck(h: *const Health, a: Allocator, st: api.Status, inflight: usize) Allocator.Error!?[]const u8 {
+    /// Why the engine is stuck (no round with work in flight, no round completed at all, or a slow pace held
+    /// too long), or null. Inputs only: it walks no map and takes no mutex.
+    pub fn stuck(h: *const Health, a: Allocator, st: api.Status, rep: Report) Allocator.Error!?[]const u8 {
         const p = st.pace orelse return null;
-        const busy = inflight > 0 or st.running > 0 or st.waiting > 0;
-        if (busy and h.stall_round_s > 0) if (p.last_round_age_s) |age| if (age > h.stall_round_s)
-            return try std.fmt.allocPrint(a, "no round for {d:.0} s with work in flight", .{age});
+        const busy = rep.inflight > 0 or st.running > 0 or st.waiting > 0;
+        if (busy and h.stall_round_s > 0) {
+            if (p.last_round_age_s) |age| {
+                if (age > h.stall_round_s)
+                    return try std.fmt.allocPrint(a, "no round for {d:.0} s with work in flight", .{age});
+            } else if (rep.quiet) |_| {}
+        }
         if (h.stall_slow_s > 0 and p.slow_s > h.stall_slow_s)
             return try std.fmt.allocPrint(a, "rounds slower than their baseline for {d:.0} s (decode {d:.3} s vs {d:.3}; prefill {d:.0} vs {d:.0} rows/s)", .{ p.slow_s, p.decode_s, p.decode_base_s, p.prefill_rows_s, p.prefill_base_rows_s });
         return null;
     }
 
-    /// ``GET /health``: the status code and body. ``streams``: the engine's slots (null: not a batch engine).
-    pub fn status(h: *Health, a: Allocator, streams: ?Streams, context: u32) Allocator.Error!struct { code: u16, body: Value } {
+    /// ``GET /health``: the status code, the body, and what the stall chain needs from the inflight map.
+    /// ``streams``: the engine's slots (null: not a batch engine).
+    pub fn status(h: *Health, a: Allocator, streams: ?Streams, context: u32) Allocator.Error!Report {
         const o = try json.newObject(a);
         h.mutex.lockUncancelable(h.io);
         const t = now(h.io);
@@ -295,9 +320,13 @@ pub const Health = struct {
         const ok = h.fatal == null and st.len == 0;
         var oldest: f64 = 0;
         var running_tokens: f64 = 0;
+        var quiet: ?Quiet = null;
         for (h.inflight.values()) |e| {
             oldest = @max(oldest, secs(t - e.start));
             running_tokens += e.tokens;
+            const q = secs(t - e.last);
+            const allow = allowance(e, h.stall_round_s, h.prefill_tps);
+            if (quiet == null or q - allow > quiet.?.quiet_s - quiet.?.allowed_s) quiet = .{ .quiet_s = q, .allowed_s = allow };
         }
         const running = h.inflight.count();
         try o.put(a, "ok", .{ .bool = ok });
@@ -338,7 +367,12 @@ pub const Health = struct {
             try o.put(a, "streams", .{ .object = x });
         }
         if (context > 0) try o.put(a, "context_length", try json.intValue(a, context));
-        return .{ .code = if (h.mode == .strict and !ok) 503 else 200, .body = .{ .object = o } };
+        return .{
+            .code = if (h.mode == .strict and !ok) 503 else 200,
+            .body = .{ .object = o },
+            .inflight = running,
+            .quiet = if (running > 0) quiet else null,
+        };
     }
 
     /// ``GET /metrics``: Prometheus text, one ``model`` label.
@@ -788,15 +822,53 @@ test "health: stuck when work is in flight and no round ended for the limit, or 
     const x = arena.allocator();
     // healthy: rounds a moment ago, at their baseline
     var st: api.Status = .{ .running = 1, .pace = .{ .last_round_age_s = 0.2, .decode_s = 0.07, .decode_base_s = 0.07 } };
-    try std.testing.expect((try h.stuck(x, st, 1)) == null);
+    try std.testing.expect((try h.stuck(x, st, .{ .code = 200, .body = .null, .inflight = 1, .quiet = null })) == null);
     // no round for longer than the limit with work in flight; idle (nothing in flight) is not stuck
     st.pace.?.last_round_age_s = 121;
-    try std.testing.expect(std.mem.startsWith(u8, (try h.stuck(x, st, 1)).?, "no round for 121 s"));
+    try std.testing.expect(std.mem.startsWith(u8, (try h.stuck(x, st, .{ .code = 200, .body = .null, .inflight = 1, .quiet = null })).?, "no round for 121 s"));
     st.running = 0;
-    try std.testing.expect((try h.stuck(x, st, 0)) == null);
+    try std.testing.expect((try h.stuck(x, st, .{ .code = 200, .body = .null, .inflight = 0, .quiet = null })) == null);
     // a measured stall: 380 ms rounds against 73 ms, slow for over three minutes
     st.pace = .{ .last_round_age_s = 0.4, .decode_s = 0.38, .decode_base_s = 0.073, .slow_s = 181 };
-    try std.testing.expect(std.mem.startsWith(u8, (try h.stuck(x, st, 1)).?, "rounds slower than their baseline for 181 s"));
+    try std.testing.expect(std.mem.startsWith(u8, (try h.stuck(x, st, .{ .code = 200, .body = .null, .inflight = 1, .quiet = null })).?, "rounds slower than their baseline for 181 s"));
     // an engine that keeps no pace is never called stuck
-    try std.testing.expect((try h.stuck(x, .{ .running = 3 }, 3)) == null);
+    try std.testing.expect((try h.stuck(x, .{ .running = 3 }, .{ .code = 200, .body = .null, .inflight = 3, .quiet = null })) == null);
 }
+
+test "health: no round has completed and a request is quiet past the round limit" {
+    const a = std.testing.allocator;
+    var h = Health.init(a, std.testing.io, .{});
+    defer h.deinit();
+    var off = Health.init(a, std.testing.io, .{ .stall_round_s = 0 });
+    defer off.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const x = arena.allocator();
+    const Rep = struct {
+        fn make(inflight: usize, quiet_s: f64, allowed_s: f64) Health.Report {
+            const quiet: ?Health.Quiet = if (inflight == 0) null else .{ .quiet_s = quiet_s, .allowed_s = allowed_s };
+            return .{ .code = 200, .body = .null, .inflight = inflight, .quiet = quiet };
+        }
+    };
+    // the gap: zero rounds ever completed (Pace.last_end null), a request quiet past the round limit
+    const wedge: api.Status = .{ .running = 1, .pace = .{ .decode_s = 0.07, .decode_base_s = 0.07 } };
+    try std.testing.expectEqualStrings(
+        "no round has completed: request quiet 121 s (allow 120 s) with work in flight",
+        (try h.stuck(x, wedge, Rep.make(1, 121, 120))).?,
+    );
+    const idle: api.Status = .{ .pace = .{} };
+    try std.testing.expect((try h.stuck(x, idle, Rep.make(0, 0, 0))) == null);
+    // a request mid-prefill is legitimate while its allowance covers the quiet: the round knob plus the
+    // prefill allowance, 120 + 128k at 200 t/s = 760 s
+    try std.testing.expect((try h.stuck(x, wedge, Rep.make(1, 130, 640))) == null);
+    // a 400k prompt that has delivered nothing: the allowance covers 2000 s
+    try std.testing.expect((try h.stuck(x, wedge, Rep.make(1, 300, 2000))) == null);
+    // the threshold is the round knob BEYOND the prefill allowance, not the later of the two: 650 s of
+    // quiet inside a 760 s allowance is a slow prefill, 761 s is the stall
+    try std.testing.expect((try h.stuck(x, wedge, Rep.make(1, 650, 760))) == null);
+    try std.testing.expect((try h.stuck(x, wedge, Rep.make(1, 761, 760))) != null);
+    // a boot warm-up with nothing in flight is not a stall (the stall watch owns that seam)
+    try std.testing.expect((try h.stuck(x, .{ .running = 0, .warming = true }, Rep.make(0, 0, 0))) == null);
+    try std.testing.expect((try off.stuck(x, wedge, Rep.make(1, 600, 0))) == null);
+}
+

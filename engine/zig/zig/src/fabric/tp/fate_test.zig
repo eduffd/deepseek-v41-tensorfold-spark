@@ -21,12 +21,16 @@ fn hook(_: *anyopaque, reason: []const u8) void {
 
 const grace = 50 * std.time.ns_per_ms;
 
+/// The samplers armed on the pair before its threads start: rank 1 reports through `arm`, rank 0 stamps
+/// its own sent count through `leader`. Arming after `start` would race the fate thread's read of the fields.
+const Arms = struct { arm: ?fate.ProgressSource = null, leader: ?fate.LeaderSource = null };
+
 /// Two connected ranks' fate channels (rank 0 first), started, with recorded exits and hooks.
 fn pair(fates: *[2]Fate) !void {
-    return pairAt(.{ &fates[0], &fates[1] });
+    return pairAt(.{ &fates[0], &fates[1] }, .{});
 }
 
-fn pairAt(fates: [2]*Fate) !void {
+fn pairAt(fates: [2]*Fate, arms: Arms) !void {
     const l = try bootstrap.testListener();
     defer sock.close(l.fd);
     const deadline = sock.nowNs() + 5 * std.time.ns_per_s;
@@ -42,6 +46,8 @@ fn pairAt(fates: [2]*Fate) !void {
         f.usable = fakeUsable;
         f.onFail(.{ .ctx = f, .call = hook });
     }
+    if (arms.arm) |src| fates[1].progress_src = src;
+    if (arms.leader) |src| fates[0].leader_src = src;
     for (fates) |f| try f.start();
 }
 
@@ -120,7 +126,7 @@ test "a rank failing at boot ends both with its reason, and its channel is down 
     const pa = std.heap.page_allocator;
     var f0: Fate = undefined;
     const f1 = try pa.create(Fate);
-    try pairAt(.{ &f0, f1 });
+    try pairAt(.{ &f0, f1 }, .{});
     defer f0.close();
     sock.sleepNs(60 * std.time.ns_per_ms);
     f1.failBoot("boot", error.RopeTooShort);
@@ -147,6 +153,132 @@ test "rank 0's clean stop ends every rank with no fail-fast exit, whatever order
     try std.testing.expectEqual(@as(u32, 0), hooks.load(.acquire));
 }
 
+
+/// A follower's counters a test drives directly (no GPU): every field loadable so a report can change
+/// between two of the 20 ms periods.
+const Fake = struct {
+    plans: std.atomic.Value(u64) = .init(7),
+    doorbell: std.atomic.Value(u64) = .init(4),
+    completed: std.atomic.Value(u64) = .init(3),
+    seq: std.atomic.Value(u64) = .init(1),
+    faulted: std.atomic.Value(u32) = .init(0),
+    fault_seq: std.atomic.Value(u64) = .init(0),
+    why: std.atomic.Value(u32) = .init(0),
+    waited_us: std.atomic.Value(u64) = .init(0),
+
+    fn whyName(code: u32) fate.FaultWhy {
+        return switch (code) {
+            1 => .abort,
+            2 => .timeout,
+            3 => .unknown,
+            else => .none,
+        };
+    }
+
+    fn read(ctx: *anyopaque, out: *fate.Progress) void {
+        const x: *Fake = @ptrCast(@alignCast(ctx));
+        const f = x.faulted.load(.monotonic) != 0;
+        out.* = .{
+            .transport = .roce,
+            .plans = x.plans.load(.monotonic),
+            .doorbell = x.doorbell.load(.monotonic),
+            .completed = x.completed.load(.monotonic),
+            .report_seq = x.seq.load(.monotonic),
+            .faulted = f,
+            .fault_seq = x.fault_seq.load(.monotonic),
+            .fault_why = if (f) whyName(x.why.load(.monotonic)) else .none,
+            .waited_us = x.waited_us.load(.monotonic),
+        };
+    }
+};
+
+const Lead = struct {
+    fn read(ctx: *anyopaque) u64 {
+        return @as(*std.atomic.Value(u64), @ptrCast(@alignCast(ctx))).load(.monotonic);
+    }
+};
+
+fn waitProgress(f0: *Fate) ?Fate.Sample {
+    const t0 = sock.nowNs();
+    while (sock.nowNs() - t0 < 5 * std.time.ns_per_s) {
+        if (f0.peerProgress(1)) |s| return s;
+        sock.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return null;
+}
+
+fn waitProgressField(f0: *Fate, comptime field: []const u8, want: anytype) !bool {
+    const t0 = sock.nowNs();
+    while (sock.nowNs() - t0 < 5 * std.time.ns_per_s) {
+        if (f0.peerProgress(1)) |s| {
+            if (comptime std.meta.fieldIndex(@TypeOf(s), field) != null) {
+                if (@field(s, field) == want) return true;
+            } else if (@field(s.prog, field) == want) return true;
+        }
+        sock.sleepNs(5 * std.time.ns_per_ms);
+    }
+    return false;
+}
+
+test "a progress frame round-trips the pair, names the leader's gap, and a telemetry fault stays telemetry" {
+    reset();
+    var fates: [2]Fate = undefined;
+    var fake: Fake = .{};
+    var sent: std.atomic.Value(u64) = .init(10);
+    try pairAt(.{ &fates[0], &fates[1] }, .{ .arm = .{ .ctx = &fake, .read = Fake.read }, .leader = .{ .ctx = &sent, .read = Lead.read } });
+    defer for (&fates) |*f| f.close();
+    try std.testing.expectEqual(@as(usize, 96), fate.wire_bytes);
+    const s = waitProgress(&fates[0]) orelse return error.NoReport;
+    try std.testing.expectEqual(@as(u64, 7), s.prog.plans);
+    try std.testing.expectEqual(@as(u64, 4), s.prog.doorbell);
+    try std.testing.expectEqual(@as(u64, 3), s.prog.completed);
+    try std.testing.expectEqual(@as(u64, 0), s.gaps);
+    try std.testing.expectEqual(@as(u64, 3), s.outstanding);
+    // the pair reports on a cadence, so the ledger asserts the sender's count against the accepted
+    // count at snapshot time, not an exact frame count a second cadence tick can outrun
+    try std.testing.expect(s.frames_received >= 1);
+    try std.testing.expect(s.frames_sent >= s.frames_received);
+    try std.testing.expectEqual(fate.Kind.roce, s.prog.transport);
+    sent.store(20, .release);
+    try std.testing.expect(try waitProgressField(&fates[0], "outstanding", @as(u64, 13)));
+    fake.seq.store(4, .release);
+    try std.testing.expect(try waitProgressField(&fates[0], "gaps", @as(u64, 2)));
+    fake.faulted.store(1, .release);
+    fake.why.store(3, .release);
+    fake.fault_seq.store(11, .release);
+    try std.testing.expect(try waitProgressField(&fates[0], "fault_why", fate.FaultWhy.unknown));
+    try std.testing.expect(try waitProgressField(&fates[0], "fault_seq", @as(u64, 11)));
+    try std.testing.expectEqual(@as(u32, 0), exits.load(.acquire));
+    // refused, counted, pair alive: a telemetry frame never dies it
+    _ = fate.writeProgressRaw(fates[1].fds[0], 8, .{});
+    try std.testing.expect(try waitProgressField(&fates[0], "bad", @as(u64, 1)));
+    _ = fate.writeProgressRaw(fates[1].fds[0], 96, .{ .transport = 9 });
+    try std.testing.expect(try waitProgressField(&fates[0], "bad", @as(u64, 2)));
+    try std.testing.expectEqual(@as(u32, 0), exits.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 123 << 20), (fates[0].peerMem(1) orelse return error.NoReport).bytes);
+}
+
+test "a peer that stops reporting ages out, and its freeze lengthens with every dropped report" {
+    reset();
+    var fates: [2]Fate = undefined;
+    var fake: Fake = .{};
+    var sent: std.atomic.Value(u64) = .init(7);
+    try pairAt(.{ &fates[0], &fates[1] }, .{ .arm = .{ .ctx = &fake, .read = Fake.read }, .leader = .{ .ctx = &sent, .read = Lead.read } });
+    const s = waitProgress(&fates[0]) orelse return error.NoReport;
+    // rank 1's reports stop (its channel closes quietly: rank 0 expects the hang-up, so no fail-fast)
+    fates[0].expectStop();
+    fates[1].expectStop();
+    fates[1].close();
+    fates[0].close();
+    sock.sleepNs(150 * std.time.ns_per_ms);
+    const aged = fates[0].peerProgress(1) orelse return error.NoReport;
+    try std.testing.expectEqual(s.prog.plans, aged.prog.plans);
+    try std.testing.expectEqual(@as(u64, 0), aged.outstanding);
+    try std.testing.expect(aged.age_ns > s.age_ns + 100 * std.time.ns_per_ms);
+    try std.testing.expect(aged.frozen_s > s.frozen_s + 0.1);
+    try std.testing.expectEqual(@as(u32, 0), exits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), hooks.load(.acquire));
+}
 
 // -- a stop's drain (server/serve.zig) on two ranks: the plan link and the fate channel as Forward.stop uses them --
 
