@@ -30,3 +30,7 @@ build/
 
 # verification proof artifacts (node paths/hosts in them; never publish)
 results/verify/
+
+# agent run trails and the per-machine agent skills (trails cite node paths and hosts)
+.audit/
+.claude/
