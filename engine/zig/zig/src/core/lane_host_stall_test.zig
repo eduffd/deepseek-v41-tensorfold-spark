@@ -79,7 +79,8 @@ test "a round wedged in plan exits 70 past the watch's exit knob" {
 
     Exit.code.store(0, .release);
     var cap: Cap = .{};
-    try host.startStall(.{ .limit_s = 0.02, .exit_s = 0.05, .poll_ns = 5 * std.time.ns_per_ms }, Exit.record, .{ .ctx = &cap, .line = Cap.line });
+    // null hook: this rank's exit is the bare one, which is what a host without a peer layer does
+    try host.startStall(.{ .limit_s = 0.02, .exit_s = 0.05, .poll_ns = 5 * std.time.ns_per_ms }, Exit.record, .{ .ctx = &cap, .line = Cap.line }, null);
     try host.start();
     defer host.stop();
     // a wedged planner must not hold the stop: the gate opens before the join

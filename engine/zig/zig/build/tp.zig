@@ -2,6 +2,7 @@
 //! the mailbox kernel, built by `-Dtp-nvcc=` or embedded from a prebuilt `-Dtp-fatbin=`.
 
 const std = @import("std");
+const stall_build = @import("stall.zig");
 
 /// The CUDA runtime without the engine's kernels (tp only needs the driver, memory, streams and NCCL).
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -13,11 +14,15 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-/// The `tp` module over `cuda` (an engine passes its own runtime module); verbs (zig/src/fabric/verbs.zig) for RoCE.
-pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module) *std.Build.Module {
+/// The `tp` module over `cuda` (an engine passes its own runtime module) and `stall` (zig/build/stall.zig; an engine
+/// passes the one module its binary also gives `engine_api`); verbs (zig/src/fabric/verbs.zig) for RoCE.
+pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, stall: *std.Build.Module) *std.Build.Module {
     const m = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/tp.zig"), .target = target, .optimize = optimize, .link_libc = true });
     m.addImport("cuda", cuda);
     m.addImport("verbs", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/verbs.zig"), .target = target, .optimize = optimize, .link_libc = true }));
+    // the pair's one allowance formula (core/stall.zig): the peer-wait clock's bound and `/health`'s null gap read the
+    // same struct, so the two verdicts cannot drift. The binary that links `engine_api` too must hand it this same module.
+    m.addImport("stall", stall);
     return m;
 }
 
@@ -42,7 +47,7 @@ fn kernelModule(b: *std.Build, image: ?std.Build.LazyPath) *std.Build.Module {
 
 pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step) void {
     const host = b.graph.host;
-    const tests = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, runtime(b, host, .debug)) }));
+    const tests = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, runtime(b, host, .debug), stall_build.module(b, host, .debug)) }));
     b.step("test-tp", "Tensor parallelism's host tests: bootstrap, fate channel, in-process ranks (no GPU)").dependOn(&tests.step);
     test_step.dependOn(&tests.step);
     if (target.result.os.tag != .linux) return;
@@ -52,7 +57,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const cuda = runtime(b, target, optimize);
     const runner = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/tp/gpu_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     runner.addImport("cuda", cuda);
-    runner.addImport("tp", module(b, target, optimize, cuda));
+    runner.addImport("tp", module(b, target, optimize, cuda, stall_build.module(b, target, optimize)));
     runner.addImport("tp_kernel", kernelModule(b, image));
     const exe = b.addExecutable(.{ .name = "tf-tp-test", .root_module = runner });
     b.installArtifact(exe);

@@ -213,7 +213,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // the checkpoint reader alone (the family's only use of core): the serving module brings the tokenizer itself
     dsv41_m1.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     dsv41_m1.addImport("dsv41_kernels", dsv41);
-    const m1_tp = @import("tp.zig").module(b, target, optimize, cuda);
+    // one stall module for this binary: `tp`'s peer-wait clock and `engine_api`'s `/health` gap (via serve_engine.zig)
+    // both name it; a second module over stall.zig here is what made `zig build install` refuse to link.
+    const m1_stall = @import("stall.zig").module(b, target, optimize);
+    const m1_tp = @import("tp.zig").module(b, target, optimize, cuda, m1_stall);
     dsv41_m1.addImport("tp", m1_tp); // M2's forward: the TP collectives
     dsv41_m1.addImport("kv", @import("kv.zig").module(b, target, optimize, cuda, m1_tp)); // M5: the paged pool, split KV, sessions
     const dsv41_lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -221,6 +224,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // M4: the served engine (serve_engine.zig) for follow / generate, over the server's engine seam
     const dsv41_api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true });
     dsv41_api.addImport("lanes", dsv41_lanes);
+    dsv41_api.addImport("stall", m1_stall);
     dsv41_m1.addImport("engine_api", dsv41_api);
     const m1_serve = @import("sampling.zig").serve(b, target, optimize, dsv41_lanes).serve;
     dsv41_m1.addImport("dsv41_serve", m1_serve); // the keyed sampler's Picker
@@ -235,17 +239,18 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_engine.addImport("cuda", cuda);
     ds_engine.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/safetensors_root.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     ds_engine.addImport("dsv41_kernels", dsv41);
-    const engine_tp = @import("tp.zig").module(b, target, optimize, cuda);
+    const engine_stall = @import("stall.zig").module(b, target, optimize); // the one stall module this exe links (see m1 above)
+    const engine_tp = @import("tp.zig").module(b, target, optimize, cuda, engine_stall);
     ds_engine.addImport("tp", engine_tp);
     ds_engine.addImport("kv", @import("kv.zig").module(b, target, optimize, cuda, engine_tp));
     @import("grammar.zig").addTo(b, ds_engine, target, optimize); // structured output (grammar_gpu.zig)
-    b.installArtifact(b.addExecutable(.{ .name = "tensorfold-dsv41", .root_module = @import("server.zig").withEngine(b, target, .ReleaseSafe, ds_engine, build_options) }));
+    b.installArtifact(b.addExecutable(.{ .name = "tensorfold-dsv41", .root_module = @import("server.zig").withEngine(b, target, .ReleaseSafe, ds_engine, build_options, engine_stall) }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true);
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "stall", .module = @import("stall.zig").module(b, target, optimize) } } });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
@@ -286,17 +291,19 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
     const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
+    // these `tp` test binaries link no `engine_api`, so one host stall module serves all of them
+    const stallm = @import("stall.zig").module(b, host, .debug);
     for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, native, stagger(b, host, .debug), dsv41Kernels(b, host, .debug, cuda, &.{}) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     // the DSV4.1 decode graphs' buckets, statics and floor (R4; the cache itself is in the runtime's tests)
     const graphs = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/graphs.zig"), .target = host, .optimize = .debug, .link_libc = true });
     graphs.addImport("cuda", cuda);
-    graphs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    graphs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = graphs })).step);
     // DSV4.1 row mode (several slots): rowtab's tables and rowmode's program over the real emitter (block.emit)
     const rows = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/rows_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     rows.addImport("cuda", cuda);
     rows.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    rows.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    rows.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     const rows_run = b.addRunArtifact(b.addTest(.{ .root_module = rows }));
     b.step("test-dsv41-rows", "DeepSeek-V4.1 row mode (several slots) on the real emitter, host only").dependOn(&rows_run.step);
     step.dependOn(&rows_run.step);
@@ -304,7 +311,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const wide = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/wide_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     wide.addImport("cuda", cuda);
     wide.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    wide.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    wide.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     const wide_run = b.addRunArtifact(b.addTest(.{ .root_module = wide }));
     b.step("test-dsv41-wide", "DeepSeek-V4.1 decode windows past 16 rows on the real emitter, host only").dependOn(&wide_run.step);
     step.dependOn(&wide_run.step);
@@ -312,7 +319,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const knobs = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/prod_knobs_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     knobs.addImport("cuda", cuda);
     knobs.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    knobs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    knobs.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     const knobs_run = b.addRunArtifact(b.addTest(.{ .root_module = knobs }));
     b.step("test-dsv41-knobs", "DeepSeek-V4.1 prod knobs (fused dense prefill, rows, read-ahead) on the real prefill emitter, host only").dependOn(&knobs_run.step);
     step.dependOn(&knobs_run.step);
@@ -320,7 +327,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const mdraft = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/mdraft_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     mdraft.addImport("cuda", cuda);
     mdraft.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    mdraft.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    mdraft.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     // the device chain's staging reads draft/dspark.zig's Params (the lanes core's Sampling)
     mdraft.addImport("lanes", b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true }));
     const mdraft_run = b.addRunArtifact(b.addTest(.{ .root_module = mdraft }));
@@ -330,7 +337,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const longpf = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/longpf_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     longpf.addImport("cuda", cuda);
     longpf.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    longpf.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    longpf.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     const longpf_run = b.addRunArtifact(b.addTest(.{ .root_module = longpf }));
     b.step("test-dsv41-longpf", "DeepSeek-V4.1 long prompts (stream top-k, split KV's row blocks) on the real prefill emitter, host only").dependOn(&longpf_run.step);
     step.dependOn(&longpf_run.step);
@@ -338,7 +345,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const vplan = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/vision_plan_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     vplan.addImport("cuda", cuda);
     vplan.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    vplan.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    vplan.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     const vplan_run = b.addRunArtifact(b.addTest(.{ .root_module = vplan }));
     b.step("test-dsv41-vision-plan", "DeepSeek-V4.1 image prompts' buffer roles (the boot check, the plan's options), host only").dependOn(&vplan_run.step);
     step.dependOn(&vplan_run.step);
@@ -346,7 +353,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     const gm2pf = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/gm2pf_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
     gm2pf.addImport("cuda", cuda);
     gm2pf.addImport("dsv41_kernels", dsv41Kernels(b, host, .debug, cuda, &.{}));
-    gm2pf.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda));
+    gm2pf.addImport("tp", @import("tp.zig").module(b, host, .debug, cuda, stallm));
     const gm2pf_run = b.addRunArtifact(b.addTest(.{ .root_module = gm2pf }));
     b.step("test-dsv41-gm2pf", "DeepSeek-V4.1 x3gm v2 (TF_DSV41_GM_V2) on the real prefill emitter, host only").dependOn(&gm2pf_run.step);
     step.dependOn(&gm2pf_run.step);

@@ -89,8 +89,13 @@ pub const Session = struct {
         s.peer = peerwait.Clock{
             .settings = .{
                 .rank = cfg.rank,
-                .silence_ns = cfg.peer_wait_ns,
-                .prefill_ns_per_row = if (cfg.prefill_tps > 0) @intFromFloat(@min(1e9 / cfg.prefill_tps, 1e15)) else 0,
+                // the allowance is the knob's own unit (seconds) plus the rows/prefill-tps widening; the clock asks it
+                // for nanoseconds. The config carries the knob in ns (its boot guard compares it against the mailbox
+                // timeout in ns), so this is the one place the two units meet.
+                .allowance = .{
+                    .base_s = @as(f64, @floatFromInt(cfg.peer_wait_ns)) / 1e9,
+                    .prefill_tps = cfg.prefill_tps,
+                },
             },
             .progress = fate.ProgressSource{ .ctx = s, .read = peerProgress },
         };
@@ -319,8 +324,11 @@ pub const Session = struct {
     /// A follower's round watch giving up on a round the leader opened and never closed: this rank's own witness,
     /// named with the round its markers carry. The silence clock's `armed` gate does not apply here: the watch's
     /// evidence stands by itself.
-    pub fn peerRoundWatchExit(s: *Session) void {
-        _ = s.peer.fault(.{ .round_watch = .{ .rank = s.cfg.rank, .round = s.peer.round_no.load(.acquire) } });
+    /// True when this call is the one that named the exit; false when an expiry was already underway, whose own caller
+    /// ends the process. Rank 0's stall-exit reroute reads that (the watch's exit knob is not a silence the clock
+    /// counts, so the watch is the witness, and the exit must be named exactly once).
+    pub fn peerRoundWatchExit(s: *Session) bool {
+        return s.peer.fault(.{ .round_watch = .{ .rank = s.cfg.rank, .round = s.peer.round_no.load(.acquire) } });
     }
 
     /// One transport poll per round, both ranks at the same lockstep position (rank 0 at the round's close stamp,

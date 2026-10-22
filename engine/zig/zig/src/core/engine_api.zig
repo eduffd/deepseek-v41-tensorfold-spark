@@ -365,8 +365,9 @@ pub const prompt_imprint = @import("prompt_imprint.zig");
 /// The idle keepalive's ticker and target contract.
 pub const keepalive = @import("keepalive.zig");
 
-/// A round's stall clock, its report and its exit (stall.zig).
-pub const stall = @import("stall.zig");
+/// A round's stall clock, its report and its exit (the `stall` module, zig/src/core/stall.zig): the same module `tp`
+/// arms its peer-wait clock with, so one `Allowance` is the bound both ranks quote.
+pub const stall = @import("stall");
 
 test {
     _ = @import("lane_host.zig");
@@ -375,5 +376,5 @@ test {
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
-    _ = @import("stall.zig");
+    _ = @import("stall");
 }

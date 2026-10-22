@@ -297,7 +297,7 @@ test "a post the HCAs never complete: the proxy halts the link, names the wait o
     var clock: peerwait.Clock = .{
         // the silence clock itself never expires on this hour-long bound: the expiry here is the proxy's, witnessed
         // by its own link, not by a counted silence
-        .settings = .{ .rank = 0, .silence_ns = std.time.ns_per_hour },
+        .settings = .{ .rank = 0, .allowance = .{ .base_s = 3600 } },
         .sink = .{ .ctx = &named, .call = Named.line },
         .exit_fn = recordExit,
     };

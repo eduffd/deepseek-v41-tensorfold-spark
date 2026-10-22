@@ -4,7 +4,7 @@ const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
 const pace_mod = @import("pace.zig");
-const stall_mod = @import("stall.zig");
+const stall_mod = @import("stall"); // the `stall` module engine_api wires in: engine_api's test files reach this file by path
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -160,12 +160,22 @@ pub const LaneHost = struct {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
-    /// Installs the stall watch before `start` spawns the engine.
-    pub fn startStall(h: *LaneHost, settings: stall_mod.Settings, exit_fn: *const fn (u8) void, sink: stall_mod.Sink) !void {
+    /// Installs the stall watch before `start` spawns the engine. `exit_hook`, when given, runs in place of `exit_fn`
+    /// at the exit knob: the serving pair hands it one so the exit is named through the peer layer (the peer gets the
+    /// reason, not a socket close); null is this tree's bare exit. Set before the thread starts, like the rest of the
+    /// watch, so the thread never reads a field another thread is writing.
+    pub fn startStall(
+        h: *LaneHost,
+        settings: stall_mod.Settings,
+        exit_fn: *const fn (u8) void,
+        sink: stall_mod.Sink,
+        exit_hook: ?stall_mod.Watch.ExitHook,
+    ) !void {
         if (!settings.on()) return;
         h.watch = stall_mod.Watch.init(h.io, settings);
         const w = &h.watch.?;
         w.exit_fn = exit_fn;
+        w.exit_hook = exit_hook;
         w.sink = sink;
         try w.start();
     }

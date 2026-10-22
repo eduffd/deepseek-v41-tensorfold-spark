@@ -63,11 +63,19 @@ const Cap = struct {
 };
 
 /// Each clock starts its injected `now` at `base`: `advance` steps this test's own clock, not the one the test
-/// before it left running, so a bound is measured from a known instant.
+/// before it left running, so a bound is measured from a known instant. The tests speak nanoseconds (a bound is pinned
+/// to the nanosecond), while `Settings` carries the knob's units, so the allowance is built here: `nanos` rounds to the
+/// nearest ns, which is what makes these bounds come back exactly the number the test wrote.
 fn clock(rank: u32, silence_ns: u64, per_row_ns: u64, cap: *Cap, src: ?*Src) Clock {
     now_t.store(base, .monotonic);
     return .{
-        .settings = .{ .rank = rank, .silence_ns = silence_ns, .prefill_ns_per_row = per_row_ns },
+        .settings = .{
+            .rank = rank,
+            .allowance = .{
+                .base_s = @as(f64, @floatFromInt(silence_ns)) / 1e9,
+                .prefill_tps = if (per_row_ns > 0) 1e9 / @as(f64, @floatFromInt(per_row_ns)) else 0,
+            },
+        },
         .now = injectedNow,
         .sink = .{ .ctx = cap, .call = Cap.line },
         .progress = if (src) |s| fate.ProgressSource{ .ctx = s, .read = Src.read } else null,

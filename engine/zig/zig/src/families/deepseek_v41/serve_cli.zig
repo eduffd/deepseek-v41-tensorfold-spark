@@ -55,9 +55,9 @@ pub fn follow(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []co
 
 /// The round watch's exit: the named fault and Fate, the way every other fault this rank sees goes down.
 fn peerWatchExit(ctx: *anyopaque, code: u8) void {
-    _ = code;
+    _ = code; // the named route carries it: Fate exits 70, the witness serve.sh reads
     const m: *model.Model = @ptrCast(@alignCast(ctx));
-    m.session.peerRoundWatchExit();
+    _ = m.session.peerRoundWatchExit(); // true: this call named it; false: one is underway and exiting
 }
 
 const Box = struct {

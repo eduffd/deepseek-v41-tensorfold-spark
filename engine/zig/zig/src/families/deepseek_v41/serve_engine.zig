@@ -35,17 +35,28 @@ pub fn chip(_: Allocator) ?[]const u8 {
 }
 
 /// TF_DSV41_STALL_S / _EXIT_S (GLM53_TF_ first, as app.alias_knobs): the engine's own stall watch; null with `problem`.
+/// The settings carry the spelling each value came from, because the report line and the exit line quote it.
 fn stallSettings(problem: *[]const u8) ?api.stall.Settings {
-    var s: api.stall.Settings = .{};
-    s.limit_s = stallKnob("STALL_S", 300, problem, "TF_DSV41_STALL_S / GLM53_TF_STALL_S: seconds, a number >= 0") orelse return null;
-    s.exit_s = stallKnob("STALL_EXIT_S", 0, problem, "TF_DSV41_STALL_EXIT_S / GLM53_TF_STALL_EXIT_S: seconds, a number >= 0") orelse return null;
-    return s;
+    const lim = stallKnob("STALL_S", 300, problem, "TF_DSV41_STALL_S / GLM53_TF_STALL_S: seconds, a number >= 0") orelse return null;
+    const ex = stallKnob("STALL_EXIT_S", 0, problem, "TF_DSV41_STALL_EXIT_S / GLM53_TF_STALL_EXIT_S: seconds, a number >= 0") orelse return null;
+    // a report that names the spelling nobody set sends the operator to the wrong setting, so the line quotes the one
+    // this rank read. Unset names the TF_DSV41_ spelling: that is the value's own name (the documented default).
+    return .{ .limit_s = lim.value, .limit_knob = lim.knob, .exit_s = ex.value, .exit_knob = ex.knob };
 }
 
-fn stallKnob(comptime name: []const u8, default: f64, problem: *[]const u8, message: []const u8) ?f64 {
-    const raw = std.c.getenv("GLM53_TF_" ++ name) orelse std.c.getenv("TF_DSV41_" ++ name) orelse return default;
+/// A stall knob's value and the winning spelling, so a report can name it: GLM53_TF_ first (the documented
+/// precedence), then TF_DSV41_.
+const Knob = struct { value: f64, knob: []const u8 };
+
+fn stallKnob(comptime name: []const u8, default: f64, problem: *[]const u8, message: []const u8) ?Knob {
+    if (std.c.getenv("GLM53_TF_" ++ name)) |raw| return parseKnob(raw, "GLM53_TF_" ++ name, default, problem, message);
+    if (std.c.getenv("TF_DSV41_" ++ name)) |raw| return parseKnob(raw, "TF_DSV41_" ++ name, default, problem, message);
+    return .{ .value = default, .knob = "TF_DSV41_" ++ name };
+}
+
+fn parseKnob(raw: [*c]u8, spelling: []const u8, default: f64, problem: *[]const u8, message: []const u8) ?Knob {
     const t = std.mem.trim(u8, std.mem.span(raw), " \t");
-    if (t.len == 0) return default;
+    if (t.len == 0) return .{ .value = default, .knob = spelling }; // set-but-blank keeps this tree's meaning: default
     const x = std.fmt.parseFloat(f64, t) catch {
         problem.* = message;
         return null;
@@ -54,7 +65,7 @@ fn stallKnob(comptime name: []const u8, default: f64, problem: *[]const u8, mess
         problem.* = message;
         return null;
     }
-    return x;
+    return .{ .value = x, .knob = spelling };
 }
 
 /// The engine for `o.dir`, or null with `problem` set (the native_engines contract).
@@ -184,9 +195,15 @@ pub const Served = struct {
         s.host.graphs = .{ .read = readGraphs };
         // /health's "peer": rank 1's transport counters, read from the fate channel's lock-free snapshot
         s.host.peer = .{ .ctx = m, .read = readPeer };
-        // TF_DSV41_PEER_WAIT_S: rank 0's round bracket on the plan stream, on the host's own stamps. Off the knob
-        // the host carries no hook at all, so the plan stream is exactly what it was.
-        if (m.session.cfg.peer_wait_ns > 0) s.host.on_round = .{ .ctx = m, .begin = roundOpen, .end = roundClose };
+        // TF_DSV41_PEER_WAIT_S: one condition arms both halves of rank 0's peer layer, so no rank carries the round
+        // bracket without the exit reroute (the reroute's safety rests on the clock being armed): the bracket on the
+        // host's own stamps, and the stall watch's exit named through that clock. Off the knob the host carries
+        // neither, so the plan stream and the bare exit are exactly what this tree had.
+        var stall_exit: ?api.stall.Watch.ExitHook = null;
+        if (m.session.cfg.peer_wait_ns > 0) {
+            s.host.on_round = .{ .ctx = m, .begin = roundOpen, .end = roundClose };
+            stall_exit = .{ .ctx = m, .run = peerStallExit };
+        }
         // TF_DSV41_PREFILL_PIECES=1: prod's batcher plans the rounds (queued admissions, prompts in pieces between
         // decode rounds); the served shape only (own prefill, the verify tail), every rank with the same setting
         s.sched = null;
@@ -212,7 +229,7 @@ pub const Served = struct {
             s.host.proposers = .{ .ctx = pl, .make = makeLookup, .free = freeLookup };
             std.log.info("dsv41 lookup: Python's priced plan (min match {d}, up to {d} rows{s})", .{ ls.min_match, ls.max_rows, if (ls.lookup) "" else ", lookup off" });
         }
-        try s.host.startStall(stall, api.stall.exitNow, .{});
+        try s.host.startStall(stall, api.stall.exitNow, .{}, stall_exit);
         try s.host.start();
         errdefer s.host.stop(); // a later boot failure joins both threads
         if (s.gengine) |ge| ge.inner = s.host.engine();
@@ -225,6 +242,16 @@ pub const Served = struct {
     fn syncStream(ctx: *anyopaque) anyerror!void {
         const m: *model.Model = @ptrCast(@alignCast(ctx));
         try m.stream.synchronize();
+    }
+
+    /// Rank 0's round clock ran past its exit knob: name the round through the peer layer, so the peer dies knowing
+    /// why instead of watching a socket close. The FAIL frame carries the round watch's sentence, and Fate's exit is
+    /// the same 70 the watchdog keys on. Nothing here exits on top of that: the hook is installed only while the clock
+    /// is armed, so a false return means an expiry already underway, whose own caller ends the process.
+    fn peerStallExit(ctx: *anyopaque, code: u8) void {
+        const m: *model.Model = @ptrCast(@alignCast(ctx));
+        _ = code; // the named route carries it: Fate exits 70, the witness serve.sh reads
+        _ = m.session.peerRoundWatchExit(); // true: this call named it; false: one is underway and exiting
     }
 
     /// The peer-wait round bracket, opened and closed on the host's stamps: `round_open` before the round's frames,

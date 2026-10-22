@@ -5,6 +5,7 @@
 const std = @import("std");
 const server_build = @import("server.zig");
 const tp_build = @import("tp.zig");
+const stall_build = @import("stall.zig");
 
 /// The CUDA runtime without the engine's kernels (tp's in-process ranks need only its types).
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -33,7 +34,7 @@ pub fn add(b: *std.Build, test_step: *std.Build.Step) void {
         .optimize = .debug,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "tp", .module = tp_build.module(b, host, .debug, runtime(b, host, .debug)) },
+            .{ .name = "tp", .module = tp_build.module(b, host, .debug, runtime(b, host, .debug), stall_build.module(b, host, .debug)) },
             .{ .name = "lanes", .module = lanes },
             .{ .name = "dsv41_serve", .module = s.serve },
             .{ .name = "json", .module = s.json },
@@ -56,7 +57,7 @@ pub fn gpu(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .imports = &.{
             .{ .name = "cuda", .module = cuda },
             .{ .name = "dsv41_kernels", .module = kernels },
-            .{ .name = "tp", .module = tp_build.module(b, target, optimize, cuda) },
+            .{ .name = "tp", .module = tp_build.module(b, target, optimize, cuda, stall_build.module(b, target, optimize)) },
             .{ .name = "dsv41_serve", .module = serve(b, target, optimize, lanes).serve },
         },
     });
