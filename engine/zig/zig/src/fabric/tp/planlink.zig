@@ -3,12 +3,26 @@ const std = @import("std");
 const sock = @import("sock.zig");
 const builtin = @import("builtin");
 const config = @import("config.zig");
+const peerwait = @import("peerwait.zig");
 const linux = std.os.linux;
 
 pub const max_ranks = 64;
 const more: u32 = 0x8000; // MSG_MORE: the length and the ints leave as one segment
 
-pub const Error = error{ PeerClosed, TooLarge, NotRankZero, NotFollower };
+/// `PeerStalled` is the peer-wait deadline expiring on a read or a send: a peer that stopped moving, not one that
+/// died (`PeerClosed`). Keeping the two apart is what lets the pair say which fault it is burying.
+pub const Error = error{ PeerClosed, PeerStalled, TooLarge, NotRankZero, NotFollower };
+
+/// The round bracket rank 0's plan stream carries: a round opens with its number, and closes. Non-empty frames by
+/// protocol (a follower rejects an empty one); a follower arms its own clocks from the number its leader names.
+pub const op_round_open: i64 = 66;
+pub const op_round_close: i64 = 67;
+
+/// The armed deadline for the next wait, asked once per read and once per send (`peerwait.Clock.deadline`).
+pub const DeadlineSource = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque) ?u64 };
+
+/// A wait expired: the cause names the wait, and the clock fills the round and allowance a link cannot know.
+pub const DeadlineHook = struct { ctx: *anyopaque, call: *const fn (ctx: *anyopaque, cause: peerwait.Cause) void };
 
 /// Largest plan either side accepts: 64M words (512 MiB). An admission carries its prompt ids (~1M words for a 1M-token
 /// prompt); the cap keeps a garbled length from becoming a 4 GiB allocation.
@@ -36,9 +50,27 @@ pub const PlanLink = struct {
     pin: ?config.PlanPin = null,
     avoid: ?u32 = null,
     pinned: bool = false,
+    /// The peer-wait layer (peerwait.zig): the deadline asked per wait, and who hears it when one expires. Both
+    /// null off the knob: the reads and sends block forever, as they always did.
+    deadline_src: ?DeadlineSource = null,
+    on_deadline: ?DeadlineHook = null,
 
     pub fn init(rank: u32, world: u32, fds: [max_ranks]sock.Fd) PlanLink {
         return .{ .rank = rank, .world = world, .fds = fds };
+    }
+
+    /// One sock error named: a peer that stopped reading is `PeerStalled` (and the hook hears it first), a peer
+    /// that died stays `PeerClosed`.
+    fn named(p: *PlanLink, e: sock.Error, cause: peerwait.Cause) Error {
+        if (e == error.Timeout) {
+            if (p.on_deadline) |h| h.call(h.ctx, cause);
+            return error.PeerStalled;
+        }
+        return error.PeerClosed;
+    }
+
+    fn deadline(p: *PlanLink) ?u64 {
+        return if (p.deadline_src) |s| s.call(s.ctx) else null;
     }
 
     /// Rank 0: one plan to every other rank. Host only: nothing waits on a GPU.
@@ -46,62 +78,82 @@ pub const PlanLink = struct {
         if (p.rank != 0) return error.NotRankZero;
         if (ints.len > max_frame_words) return error.TooLarge;
         p.pinOnce();
+        const dl = p.deadline();
         const bytes = std.mem.sliceAsBytes(ints);
         const len: u32 = @intCast(bytes.len);
         for (p.fds[1..p.world]) |fd| {
-            if (std.c.send(fd, &len, 4, std.posix.MSG.NOSIGNAL | more) != 4) return error.PeerClosed;
-            sock.sendAll(fd, bytes) catch return error.PeerClosed;
+            const why = peerwait.Cause{ .plan_send = .{ .rank = p.rank, .sent = p.sent.load(.acquire) } };
+            sock.sendFlagged(fd, std.mem.asBytes(&len), std.posix.MSG.NOSIGNAL | more, dl) catch |e| return p.named(e, why);
+            sock.sendAll(fd, bytes, dl) catch |e| return p.named(e, why);
         }
-        _ = p.sent.fetchAdd(1, .release);
+        _ = p.sent.fetchAdd(1, .release); // every peer took the whole frame; a mid-frame expiry never reaches here
+    }
+
+    /// The round bracket, on the plan stream and under the same deadline discipline as any other frame.
+    pub fn sendRoundOpen(p: *PlanLink, round_no: u64) Error!void {
+        return p.send(&.{ op_round_open, @bitCast(round_no) });
+    }
+
+    pub fn sendRoundClose(p: *PlanLink) Error!void {
+        return p.send(&.{op_round_close});
     }
 
     /// The other ranks: the next plan into `out` (returned: the ints it holds). Blocks as long as rank 0 is idle; a
-    /// rank 0 that is gone ends it (`error.PeerClosed`; the fate channel ends the process right after). A frame larger
-    /// than `out` is read and dropped (`error.TooLarge`), so the link stays on frame boundaries; `recvGrow` instead
-    /// takes any plan up to `max_frame_words`.
+    /// rank 0 that is gone ends it (`error.PeerClosed`; the fate channel ends the process right after), and one that
+    /// stopped moving ends it past the armed deadline (`error.PeerStalled`, and the hook names the wait first). A
+    /// frame larger than `out` is read and dropped (`error.TooLarge`), so the link stays on frame boundaries;
+    /// `recvGrow` instead takes any plan up to `max_frame_words`. The deadline is asked once per plan, so a frame's
+    /// header, body and drop share one bound.
     pub fn recv(p: *PlanLink, out: []i64) Error![]i64 {
-        const n = try p.header();
+        const dl = p.deadline();
+        const n = try p.header(dl);
         if (n > out.len) {
-            try p.drop(n);
+            try p.drop(n, dl);
             return error.TooLarge;
         }
-        return p.body(out[0..n]);
+        return p.body(out[0..n], dl);
     }
 
     /// The next plan into `buf`, grown to the frame (admissions with long prompts); the buffer is kept for the next
     /// call, so a steady stream of window plans allocates nothing.
     pub fn recvGrow(p: *PlanLink, gpa: std.mem.Allocator, buf: *std.ArrayList(i64)) (Error || std.mem.Allocator.Error)![]i64 {
-        const n = try p.header();
+        const dl = p.deadline();
+        const n = try p.header(dl);
         if (n > max_frame_words) {
-            try p.drop(n);
+            try p.drop(n, dl);
             return error.TooLarge;
         }
         try buf.resize(gpa, n);
-        return p.body(buf.items);
+        return p.body(buf.items, dl);
     }
 
     /// The next frame's length in words.
-    fn header(p: *PlanLink) Error!usize {
+    fn header(p: *PlanLink, dl: ?u64) Error!usize {
         if (p.rank == 0) return error.NotFollower;
         p.pinOnce();
         if (p.spin_ns > 0) p.spin();
         var len: u32 = undefined;
-        sock.recvExact(p.fds[0], std.mem.asBytes(&len), null) catch return error.PeerClosed;
+        const why = peerwait.Cause{ .plan_recv = .{ .rank = p.rank, .received = p.received.load(.acquire) } };
+        sock.recvExact(p.fds[0], std.mem.asBytes(&len), dl) catch |e| return p.named(e, why);
         if (len % 8 != 0) return error.PeerClosed; // not a frame boundary: the stream is lost
         return len / 8;
     }
 
-    fn body(p: *PlanLink, out: []i64) Error![]i64 {
-        sock.recvExact(p.fds[0], std.mem.sliceAsBytes(out), null) catch return error.PeerClosed;
+    fn body(p: *PlanLink, out: []i64, dl: ?u64) Error![]i64 {
+        const why = peerwait.Cause{ .plan_recv = .{ .rank = p.rank, .received = p.received.load(.acquire) } };
+        sock.recvExact(p.fds[0], std.mem.sliceAsBytes(out), dl) catch |e| return p.named(e, why);
         _ = p.received.fetchAdd(1, .release);
         return out;
     }
 
     /// Reads and drops `n` words.
-    fn drop(p: *PlanLink, n: usize) Error!void {
+    fn drop(p: *PlanLink, n: usize, dl: ?u64) Error!void {
         var left: usize = n * 8;
         var scratch: [4096]u8 = undefined;
-        while (left > 0) : (left -= @min(left, scratch.len)) sock.recvExact(p.fds[0], scratch[0..@min(left, scratch.len)], null) catch return error.PeerClosed;
+        const why = peerwait.Cause{ .plan_recv = .{ .rank = p.rank, .received = p.received.load(.acquire) } };
+        while (left > 0) : (left -= @min(left, scratch.len)) {
+            sock.recvExact(p.fds[0], scratch[0..@min(left, scratch.len)], dl) catch |e| return p.named(e, why);
+        }
     }
 
     /// Polls rank 0's socket until it is readable (or hung up) or `spin_ns` passed; the read that follows blocks.

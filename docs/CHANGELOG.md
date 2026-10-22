@@ -30,10 +30,32 @@ The production engine went `767ad9f` (G13) -> `356a188` (G14) -> `7954c1d` (G15a
   `/health`'s stall labels are unchanged, and the replay gates (`serve_cli`, `sess4`, `mdraft`, `slots`) pass the
   watch off. The `/health` chain blind to a first round that never ended is fixed in this update
   ([#3](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/3), the bullet above; its wedge root cause
-  stays open), and peer-wait deadlines ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and
-  the stale mailbox ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) remain open. The 300 s is above every
+  stays open), and so is the stale mailbox
+  ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)); peer-wait deadlines
+  ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) are the bullet below. The 300 s is above every
   measured round, but a cold whole-prompt prefill is armed from admission and p100 is unmeasured, so a legitimate
   prefill over 300 s restarts the pair.
+- **Every peer wait gets a deadline** (this update, fork
+  [issue #2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)). A rank blocked on its peer inside a
+  round blocked forever: the plan link had no deadline in either direction, a proxy that had posted and was only reaping
+  had no waiter who would ever give up, and a fault the transport had already recorded sat unread until a `check` that a
+  blocked rank never calls. `TF_DSV41_PEER_WAIT_S` (0 = off; both Zig profiles now set 600; `GLM53_TF_` wins) arms one
+  clock per rank while a round is open and disarms it at the round's boundary, counting silence in that rank's own
+  transport counters, so an idle pair never ages toward the bound. The bound is the knob plus the prompt the round
+  admitted at `GLM53_TF_STALL_PREFILL_TPS`: that sum moved out of `/health` into `core/stall.zig`'s `Allowance`, so the
+  null-gap verdict and both clocks read one formula and cannot drift. Rank 1 arms on `round_open` / `round_close`
+  markers that ride the plan stream, which is why the plan link's `outstanding` gauge now counts two marker frames per
+  round, and its read deadline now separates a peer that stopped moving (`PeerStalled`) from one that died
+  (`PeerClosed`) instead of collapsing both into a closed link. One transport poll per round, both ranks at the same
+  lockstep position, turns a fault the transport already recorded into the named expiry, and the proxy bounds the posts
+  it has outstanding against `TF_TP_MAILBOX_TIMEOUT_S`, with a boot guard refusing a peer wait set below it. An expiry
+  prints one line naming the wait, the rank, the round, the knob and the bound's length; the FAIL frame carries that
+  sentence to the peer, and both ranks exit 70 for the watchdog to heal. Rank 0's stall exit is named through the same
+  layer, so the peer dies knowing the round instead of watching a socket close. The clock's bound, the deadline the
+  sends and reads carry, the markers and the exit reroute are each covered by tests that failed at the tree before this
+  branch and pass at it; every commit was built and run on the Spark1 builder (`test-tp`, `test-server`, the serving and
+  lane-host suites green). What this branch does not claim is the on-pair proof: the wedge repro, the idle pair past the
+  bound, and a soak at 600 s run when the pair takes this build, which is a restart this branch does not make.
 - **A Zig pair that dies or wedges now restarts itself** (this update, the head-side watchdog on the Zig profile).
   `scripts/run-zig.sh` records `<code> <epoch> <boot_id>` in `$STATE_DIR/exit-r<rank>` on every invocation, so a
   `docker run --rm` rank's fail-fast exit 70 is a witnessed death and heals on the watchdog's first tick, at most once

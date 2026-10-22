@@ -1,8 +1,12 @@
 //! VerbsWire.post on fake verbs whose completions lag: bytes in flight stay at most 2 MiB, every write at most 1 MiB.
+//! The same fake HCAs drive the proxy's other bound: how long it will hold a post that never completes (roce.zig's
+//! in-flight bound) and what it does when that runs out.
 const std = @import("std");
 const verbs = @import("verbs");
 const abi = verbs.abi;
 const rv = @import("roce_verbs.zig");
+const fate = @import("fate.zig");
+const peerwait = @import("peerwait.zig");
 const Roce = @import("roce.zig").Roce;
 
 const slot: u64 = 1 << 20;
@@ -140,9 +144,14 @@ const Halts = struct {
     var halted: [2]bool = .{ false, false };
     var flushed_before_halt: u32 = 0;
     var flushes: u32 = 0;
+    /// how many QPs have been driven to ERR: a link that already failed is not halted again
+    var qp_to_err: u32 = 0;
 
     fn modifyQp(qp: *abi.Qp, attr: *abi.QpAttr, mask: c_int) callconv(.c) c_int {
-        if (attr.qp_state == abi.qps_err and mask == abi.mask.state) halted[qp.qp_num] = true;
+        if (attr.qp_state == abi.qps_err and mask == abi.mask.state) {
+            halted[qp.qp_num] = true;
+            qp_to_err += 1;
+        }
         return 0;
     }
 
@@ -203,6 +212,125 @@ test "a failed transport: the QPs go to error and every posted write is flushed 
     r.abort();
     try std.testing.expect(Halts.halted[0] and Halts.halted[1]);
     try std.testing.expect(r.failed());
+}
+
+/// What a clock reported, verbatim, and how many times it took the exit it was handed.
+var exits: u32 = 0;
+
+fn recordExit(code: u8) void {
+    std.debug.assert(code == fate.exit_code);
+    exits += 1;
+}
+
+const Named = struct {
+    lines: u32 = 0,
+    text: [512]u8 = undefined,
+    len: usize = 0,
+
+    fn line(ctx: *anyopaque, text: []const u8) void {
+        const n: *@This() = @ptrCast(@alignCast(ctx));
+        n.lines += 1;
+        const m = @min(text.len, n.text.len);
+        @memcpy(n.text[0..m], text[0..m]);
+        n.len = m;
+    }
+};
+
+/// A Roce over `w` with the in-flight bound at `timeout_ns` and `seq` ops already posted, for the proxy's own verdict.
+fn bounded(region: []align(std.heap.page_size_min) u8, w: rv.VerbsWire, timeout_ns: u64, seq: u32, clock: ?*peerwait.Clock) Roce {
+    return .{
+        .me = 0,
+        .slot_bytes = slot,
+        .timeout_ns = timeout_ns,
+        .region = region,
+        .mapping = region,
+        .wire = .{ .verbs = w },
+        .cpu = null,
+        .last_seq = .init(seq),
+        .peer = clock,
+    };
+}
+
+test "the proxy's in-flight bound: not due a hair before it, due at it, and gone once the link drains" {
+    const region = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), Roce.regionBytes(slot));
+    defer std.testing.allocator.free(region);
+    Fake.region = region;
+    Fake.reset(1); // every post completes on the next reap
+    var hw: Hw = .{};
+    var r = bounded(region, hw.wire(region), 10 * std.time.ns_per_ms, 1, null);
+    try r.wire.post(1, 1, slot);
+    try std.testing.expect(!r.linkIdle()); // this rank's post is at the HCA
+
+    r.armInflight(1); // deadline: 1 ns + 10 ms, the mailbox knob and nothing else
+    try std.testing.expect(!r.inflightPast(10 * std.time.ns_per_ms)); // one ns short: the bound is not a hair-trigger
+    try std.testing.expect(r.inflightPast(10 * std.time.ns_per_ms + 1));
+
+    // the HCAs complete it: a drained link carries no deadline, however far the clock moves
+    for (0..64) |_| {
+        if (r.linkIdle()) break;
+        try r.wire.reap();
+    }
+    try std.testing.expect(r.linkIdle());
+    try std.testing.expect(!r.inflightPast(1000 * std.time.ns_per_s));
+
+    // no mailbox timeout, no bound: the proxy never carries a deadline it cannot name a knob for
+    var off = bounded(region, hw.wire(region), 0, 1, null);
+    try off.wire.post(1, 1, slot);
+    off.armInflight(1);
+    try std.testing.expect(!off.inflightPast(1000 * std.time.ns_per_s));
+}
+
+test "a post the HCAs never complete: the proxy halts the link, names the wait once, and takes the exit with it" {
+    const region = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(4096), Roce.regionBytes(slot));
+    defer std.testing.allocator.free(region);
+    Fake.region = region;
+    Fake.reset(1);
+    Halts.halted = .{ false, false };
+    Halts.qp_to_err = 0;
+    var hw: Hw = .{};
+    var w = hw.wire(region);
+    w.v.api.ibv_modify_qp = Halts.modifyQp;
+    w.v.query_qp = Halts.queryQp;
+    for (&hw.ctx) |*c| c.ops.poll_cq = Halts.pollCq; // nothing completes until the QPs go to ERR
+    var named: Named = .{}; // what the clock said
+    var proxy_line: Named = .{}; // what the transport said, taken off the process log
+    var clock: peerwait.Clock = .{
+        // the silence clock itself never expires on this hour-long bound: the expiry here is the proxy's, witnessed
+        // by its own link, not by a counted silence
+        .settings = .{ .rank = 0, .allowance = .{ .base_s = 3600 } },
+        .sink = .{ .ctx = &named, .call = Named.line },
+        .exit_fn = recordExit,
+    };
+    var r = bounded(region, w, 10 * std.time.ns_per_ms, 2, &clock);
+    r.err_sink = .{ .ctx = &proxy_line, .call = Named.line }; // the fault line is the sentence, so pin the sentence
+    try r.wire.post(1, 1, slot);
+    try r.wire.post(0, 2, slot);
+    r.armInflight(1_000_000);
+    try std.testing.expect(r.inflightPast(11 * std.time.ns_per_ms)); // two ops still at the HCAs, past the bound
+
+    exits = 0;
+    r.proxyStalled();
+    try std.testing.expect(r.failed()); // the proxy's failure record: `check` reads it, waits end now
+    try std.testing.expect(Halts.halted[0] and Halts.halted[1]); // the HCAs stopped: a blocked thread unwinds
+    try std.testing.expectEqual(@as(u32, 2), Halts.qp_to_err); // both HCAs' QPs, once each
+    try std.testing.expectEqual(@as(u32, 1), named.lines);
+    try std.testing.expectEqual(@as(u32, 1), proxy_line.lines);
+    try std.testing.expectEqual(@as(u32, 1), exits);
+    const line = named.text[0..named.len];
+    try std.testing.expect(std.mem.indexOf(u8, line, "proxy in flight") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "posted write") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, peerwait.mailbox_knob) != null); // the knob this bound runs on, not the peer wait
+    try std.testing.expect(std.mem.indexOf(u8, line, "for 10 ms past") != null); // and the bound's own length
+    // the transport's own line names the op it is holding and the bound in the units the knob is set in
+    const fault = proxy_line.text[0..proxy_line.len];
+    try std.testing.expect(std.mem.indexOf(u8, fault, "op 2 still at the HCAs past the 10 ms bound") != null);
+    // once is enough, at both ends: the second verdict over the same wedge halts no QP, prints no line, exits again
+    // nothing. The first reason is the record `check` reads, so overwriting it would bury the root cause.
+    r.proxyStalled();
+    try std.testing.expectEqual(@as(u32, 2), Halts.qp_to_err);
+    try std.testing.expectEqual(@as(u32, 1), named.lines);
+    try std.testing.expectEqual(@as(u32, 1), proxy_line.lines);
+    try std.testing.expectEqual(@as(u32, 1), exits);
 }
 
 test "a QP whose inline capacity cannot take the 4-byte flag post is refused" {

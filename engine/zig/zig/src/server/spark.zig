@@ -263,13 +263,12 @@ pub const Health = struct {
 
     const Stalled = struct { prompt: f64, quiet_s: f64, allowed_s: f64 };
 
-    /// One request's quiet allowance: the knob plus the prefill allowance for a request that has delivered
-    /// nothing. Both stall verdicts compare against this number, so a long prefill's legitimacy cannot drift
-    /// between them.
-    fn allowance(e: Entry, base_s: f64, prefill_tps: f64) f64 {
-        var allow = base_s;
-        if (e.tokens == 0 and prefill_tps > 0) allow += e.prompt / prefill_tps;
-        return allow;
+    /// One request's quiet allowance: the pair's one allowance formula (`core/stall.zig`'s `Allowance`, the same one
+    /// the peer-wait clock arms on) based on this verdict's knob, and widened only for a request that has delivered
+    /// nothing. Both stall verdicts compare a silence against this number, so a long prefill's legitimacy cannot drift
+    /// between them, nor between this verdict and the pair's clocks.
+    fn allowance(e: Entry, base: api.stall.Allowance) f64 {
+        return base.seconds(if (e.tokens == 0) e.prompt else 0);
     }
 
     /// The most-silent in-flight request: its quiet and the allowance that covers it.
@@ -287,7 +286,7 @@ pub const Health = struct {
         var out: std.ArrayList(Stalled) = .empty;
         if (h.stall_s <= 0) return out.items;
         for (h.inflight.values()) |e| {
-            const allow = allowance(e, h.stall_s, h.prefill_tps);
+            const allow = allowance(e, .{ .base_s = h.stall_s, .prefill_tps = h.prefill_tps });
             const quiet = secs(t - e.last);
             if (quiet > allow) try out.append(a, .{ .prompt = e.prompt, .quiet_s = round(quiet, 1), .allowed_s = round(allow, 1) });
         }
@@ -328,7 +327,7 @@ pub const Health = struct {
             oldest = @max(oldest, secs(t - e.start));
             running_tokens += e.tokens;
             const q = secs(t - e.last);
-            const allow = allowance(e, h.stall_round_s, h.prefill_tps);
+            const allow = allowance(e, .{ .base_s = h.stall_round_s, .prefill_tps = h.prefill_tps });
             if (quiet == null or q - allow > quiet.?.quiet_s - quiet.?.allowed_s) quiet = .{ .quiet_s = q, .allowed_s = allow };
         }
         const running = h.inflight.count();

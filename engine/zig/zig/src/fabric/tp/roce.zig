@@ -6,6 +6,7 @@ const Bootstrap = @import("bootstrap.zig").Bootstrap;
 const sock = @import("sock.zig");
 const rv = @import("roce_verbs.zig");
 const fate = @import("fate.zig");
+const peerwait = @import("peerwait.zig");
 const HostRegister = @import("mailbox.zig").HostRegister;
 const posix = std.posix;
 const DevicePtr = collective.DevicePtr;
@@ -112,14 +113,16 @@ const Wire = union(WireKind) {
     verbs: rv.VerbsWire,
     shm: ShmWire,
 
-    fn post(w: *Wire, slot: u32, seq: u32, padded: u32) !void {
+    // `post`/`reap` are pub only so the in-flight test can put work on, and drain, the wire of a real `Roce`: the
+    // device path that would post it needs a GPU, and the thing under test is what this rank's own wire is holding.
+    pub fn post(w: *Wire, slot: u32, seq: u32, padded: u32) !void {
         switch (w.*) {
             .verbs => |*v| try v.post(slot, seq, padded),
             .shm => |*s| try s.post(slot, seq, padded),
         }
     }
 
-    fn reap(w: *Wire) !void {
+    pub fn reap(w: *Wire) !void {
         switch (w.*) {
             .verbs => |*v| try v.reap(),
             .shm => {},
@@ -164,6 +167,19 @@ pub const Roce = struct {
     /// The last sequence the proxy posted. Written by the proxy thread alone; read by `check` and the progress
     /// sampler on the serving threads, so it is atomic (a plain u32 read across threads is a data race).
     last_seq: std.atomic.Value(u32) = .init(0),
+    /// The bound on work this rank's proxy posted that the HCAs have not completed: 0 while the link is drained, else
+    /// the monotonic instant it expires. Its length is `timeout_ns` (the mailbox knob), which config's boot guard
+    /// orders under the peer wait: a device that faults records it before the host declares a stall.
+    op_deadline_ns: std.atomic.Value(u64) = .init(0),
+    /// The clock an in-flight expiry is named through (the session wires its own; null where the layer is off).
+    peer: ?*peerwait.Clock = null,
+    /// Where `fail`'s line goes (the same sink shape the clock and Fate use). Default: the process log at error
+    /// level, which is what an operator's alerting reads. A test takes the line instead, so it can pin the sentence
+    /// the operator would read, and a test run keeps its contract of logging no fault it did not mean to make:
+    /// the runner counts an error-level line as a failing step.
+    err_sink: ?peerwait.Sink = null,
+    /// Whether `fail` has recorded this link's verdict yet (host side only: the proxy thread writes it).
+    recorded: std.atomic.Value(bool) = .init(false),
     err_buf: [160]u8 = undefined,
     err_len: usize = 0,
     // host emulation of the kernel's side (tests)
@@ -339,10 +355,14 @@ pub const Roce = struct {
         return @ptrCast(@alignCast(r.region[ctrl_off + 4 * i ..].ptr));
     }
 
+    /// The proxy's verdict that this link is done. The first call records it, and its reason is the root cause, so a
+    /// later one (the loop reaches a post error after a reap error, or `proxyStalled` over a link that already
+    /// failed) prints over nothing and leaves the QPs alone: the halt, the abort flag and the record are already set.
     fn fail(r: *Roce, comptime fmt: []const u8, args: anytype) void {
+        if (r.recorded.cmpxchgWeak(false, true, .acq_rel, .acquire) != null) return;
         const s = std.fmt.bufPrint(&r.err_buf, fmt, args) catch "proxy failure";
         r.err_len = s.len;
-        std.log.err("[tensorfold] tp roce proxy: {s}", .{s});
+        if (r.err_sink) |sk| sk.call(sk.ctx, s) else std.log.err("[tensorfold] tp roce proxy: {s}", .{s});
         r.word(w_proxy_failed).store(1, .release);
         r.word(w_abort).store(1, .release); // waits on this rank end now instead of at the timeout
         r.halt();
@@ -384,8 +404,42 @@ pub const Roce = struct {
         return r.word(w_proxy_failed).load(.acquire) != 0 or r.word(w_failed).load(.acquire) != 0;
     }
 
+    /// The proxy posted work the HCAs have not completed: the bound for it starts now, and every fresh post moves it
+    /// along, so a link that keeps making progress never ages out. `timeout_ns` 0: no bound at all.
+    pub fn armInflight(r: *Roce, at: u64) void {
+        if (r.timeout_ns > 0) r.op_deadline_ns.store(at +| r.timeout_ns, .monotonic);
+    }
+
+    /// One pass of that bound, taken in the proxy's idle stretch (the only moment nothing of this rank's is being
+    /// posted, and taken after a reap, so it reads the link's own state): true while a post of this rank's is still
+    /// at the HCAs past the deadline. A drained link disarms it: an idle rank has no deadline, as a closed round has
+    /// none. The wire test drives this against fake HCAs that complete on their own schedule.
+    pub fn inflightPast(r: *Roce, at: u64) bool {
+        if (r.linkIdle()) {
+            r.op_deadline_ns.store(0, .monotonic);
+            return false;
+        }
+        const dl = r.op_deadline_ns.load(.monotonic);
+        return dl != 0 and at >= dl;
+    }
+
+    /// A post that never completed: `fail` halts the QPs, which is what releases this rank's blocked thread, and the
+    /// clock names the wait here and on the peer (the FAIL frame carries the sentence). The proxy loop's verdict on
+    /// `inflightPast`; the wire test takes it against fake HCAs that never complete a post.
+    pub fn proxyStalled(r: *Roce) void {
+        r.fail("op {d} still at the HCAs past the {d} ms bound", .{ r.last_seq.load(.monotonic), r.timeout_ns / std.time.ns_per_ms });
+        if (r.peer) |c| _ = c.fault(.{ .proxy_inflight = .{
+            .rank = r.me,
+            // the bound's own length (the mailbox knob), not the silence the clock counts: the line has to quote the
+            // setting the operator would change
+            .allow_s = @as(f64, @floatFromInt(r.timeout_ns)) / 1e9,
+            .why = "posted write",
+        } });
+    }
+
     /// roce.cpp's main_loop: spin on the doorbell, post every new sequence (at most two pending: a peer is never
-    /// more than one op ahead), reap completions while idle, nap only after a long idle stretch.
+    /// more than one op ahead), reap completions while idle, nap only after a long idle stretch. In-flight work is
+    /// bounded there too: an op the HCAs never complete ends the loop through `proxyStalled`.
     fn proxyLoop(r: *Roce) void {
         if (r.cpu) |cpu| pin(cpu);
         var idle: u64 = 0;
@@ -394,7 +448,10 @@ pub const Roce = struct {
             const seq = r.word(w_seq).load(.acquire);
             if (seq == r.last_seq.load(.monotonic)) {
                 idle += 1;
-                if (idle % 64 == 0) r.wire.reap() catch |e| return r.fail("completion: {t}", .{e});
+                if (idle % 64 == 0) {
+                    r.wire.reap() catch |e| return r.fail("completion: {t}", .{e});
+                    if (r.inflightPast(sock.nowNs())) return r.proxyStalled();
+                }
                 if (idle >= idle_spins) sock.sleepNs(20 * std.time.ns_per_us) else std.atomic.spinLoopHint();
                 continue;
             }
@@ -411,6 +468,8 @@ pub const Roce = struct {
                 if (padded == 0 or padded % 16 != 0 or padded > r.slot_bytes) return r.fail("op {d} of {d} bytes", .{ s, padded });
                 r.wire.post(s & 1, s, padded) catch |e| return r.fail("post of op {d}: {t}", .{ s, e });
                 r.last_seq.store(s, .release);
+                // the arm sits next to the post: a post cannot be on the wire without a deadline covering it
+                r.armInflight(sock.nowNs());
             }
             r.wire.reap() catch |e| return r.fail("completion: {t}", .{e});
         }

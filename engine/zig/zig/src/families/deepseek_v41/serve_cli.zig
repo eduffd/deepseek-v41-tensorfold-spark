@@ -27,12 +27,37 @@ pub fn follow(gpa: std.mem.Allocator, io: std.Io, pack: []const u8, assets: []co
     defer m.close();
     if (m.rank() == 0) return error.RankZeroServes;
     std.debug.print("rank {d}: loaded, following rank 0\n", .{m.rank()});
+    // TF_DSV41_PEER_WAIT_S: this rank's witness that a round the leader opened also closes (its markers arm it). A
+    // round that never opens is rank 0 stuck in its own round, and rank 0's stall watch names that; the exit runs
+    // through the peer layer so the leader hears the reason, not only a socket close.
+    var watch: api.stall.Watch = undefined;
+    if (m.session.cfg.peer_wait_ns > 0) {
+        const secs = @as(f64, @floatFromInt(m.session.cfg.peer_wait_ns)) / std.time.ns_per_s;
+        watch = api.stall.Watch.init(io, .{
+            .rank = m.rank(),
+            .limit_s = secs,
+            .exit_s = secs,
+            .limit_knob = "TF_DSV41_PEER_WAIT_S",
+            .exit_knob = "TF_DSV41_PEER_WAIT_S",
+        });
+        watch.exit_hook = .{ .ctx = m, .run = peerWatchExit };
+        try watch.start();
+        m.f.watch = &watch;
+    }
+    defer if (m.f.watch != null) watch.close();
     m.f.follow() catch |err| {
         std.log.err("rank {d}: following rank 0 failed: {s}", .{ m.rank(), @errorName(err) });
         return err;
     };
     std.debug.print("rank {d}: rank 0 stopped\n", .{m.rank()});
     return 0;
+}
+
+/// The round watch's exit: the named fault and Fate, the way every other fault this rank sees goes down.
+fn peerWatchExit(ctx: *anyopaque, code: u8) void {
+    _ = code; // the named route carries it: Fate exits 70, the witness serve.sh reads
+    const m: *model.Model = @ptrCast(@alignCast(ctx));
+    _ = m.session.peerRoundWatchExit(); // true: this call named it; false: one is underway and exiting
 }
 
 const Box = struct {

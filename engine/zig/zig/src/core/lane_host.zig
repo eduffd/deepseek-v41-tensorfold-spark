@@ -4,7 +4,7 @@ const lanes = @import("lanes");
 const api = @import("engine_api.zig");
 const pc = @import("prompt_cache.zig");
 const pace_mod = @import("pace.zig");
-const stall_mod = @import("stall.zig");
+const stall_mod = @import("stall"); // the `stall` module engine_api wires in: engine_api's test files reach this file by path
 const Allocator = std.mem.Allocator;
 const Id = api.Id;
 const Request = api.Request;
@@ -79,6 +79,9 @@ pub const LaneHost = struct {
     pace: pace_mod.Pace = .{},
     /// the stall watch `startStall` installed; never copied after start
     watch: ?stall_mod.Watch = null,
+    /// the peer round bracket (the family's serve seam installs it): opened and closed with the stall watch, so the
+    /// three stamp sites cannot drift apart
+    on_round: ?api.RoundHooks = null,
     round_no: u64 = 0, // engine thread only
     /// `halt`'s reason: what is left finishes failed with it (null: a stop cancels what is left)
     halt_reason: ?[]const u8 = null,
@@ -157,12 +160,22 @@ pub const LaneHost = struct {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
-    /// Installs the stall watch before `start` spawns the engine.
-    pub fn startStall(h: *LaneHost, settings: stall_mod.Settings, exit_fn: *const fn (u8) void, sink: stall_mod.Sink) !void {
+    /// Installs the stall watch before `start` spawns the engine. `exit_hook`, when given, runs in place of `exit_fn`
+    /// at the exit knob: the serving pair hands it one so the exit is named through the peer layer (the peer gets the
+    /// reason, not a socket close); null is this tree's bare exit. Set before the thread starts, like the rest of the
+    /// watch, so the thread never reads a field another thread is writing.
+    pub fn startStall(
+        h: *LaneHost,
+        settings: stall_mod.Settings,
+        exit_fn: *const fn (u8) void,
+        sink: stall_mod.Sink,
+        exit_hook: ?stall_mod.Watch.ExitHook,
+    ) !void {
         if (!settings.on()) return;
         h.watch = stall_mod.Watch.init(h.io, settings);
         const w = &h.watch.?;
         w.exit_fn = exit_fn;
+        w.exit_hook = exit_hook;
         w.sink = sink;
         try w.start();
     }
@@ -409,6 +422,19 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
+    /// One stamped round, bracketed once for both clocks. `rows`: the prompt this round admits, zero for a round
+    /// that admits nothing; a waiting peer widens its deadline by it.
+    fn beginRound(h: *LaneHost, phase: stall_mod.Phase, rows: u64) void {
+        h.round_no += 1;
+        if (h.watch) |*w| w.begin(h.round_no, phase);
+        if (h.on_round) |rh| rh.begin(rh.ctx, h.round_no, rows);
+    }
+
+    fn endRound(h: *LaneHost) void {
+        if (h.on_round) |rh| rh.end(rh.ctx);
+        if (h.watch) |*w| w.end();
+    }
+
     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
@@ -417,9 +443,8 @@ pub const LaneHost = struct {
             return false;
         }
         const job = h.queued.orderedRemove(0);
-        h.round_no += 1;
-        if (h.watch) |*w| w.begin(h.round_no, .admit);
-        defer if (h.watch) |*w| w.end();
+        beginRound(h, .admit, job.request.prompt.len);
+        defer endRound(h);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
@@ -486,9 +511,8 @@ pub const LaneHost = struct {
 
     /// One round under the family's planner; false when it did nothing (nothing to admit, prefill or decode).
     fn round(h: *LaneHost, rd: Rounds) bool {
-        h.round_no += 1;
-        if (h.watch) |*w| w.begin(h.round_no, .admit);
-        defer if (h.watch) |*w| w.end();
+        beginRound(h, .admit, 0);
+        defer endRound(h);
         var did = false;
         // the admission pass, decided whole before any of it runs
         var admits: std.ArrayList(*Job) = .empty;
@@ -834,9 +858,8 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
-            h.round_no += 1;
-            if (h.watch) |*w| w.begin(h.round_no, .decode);
-            defer if (h.watch) |*w| w.end();
+            beginRound(h, .decode, 0);
+            defer endRound(h);
             const s0 = std.Io.Clock.awake.now(h.io).toNanoseconds();
             h.core.step() catch |e| {
                 h.failAll(@errorName(e));

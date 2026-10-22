@@ -5,19 +5,54 @@ const std = @import("std");
 
 pub const exit_code: u8 = 70;
 
-/// The engine thread's round sections, in order.
-pub const Phase = enum(u8) { idle, admit, plan, pieces, finals, decode, deliver, after };
+/// The engine thread's round sections, in order. `plan_wait`/`replay` are the follower's side of a round: waiting
+/// on the leader's plan frame, then running the operations it carried.
+pub const Phase = enum(u8) { idle, admit, plan, pieces, finals, decode, deliver, after, plan_wait, replay };
 
 pub const Settings = struct {
     rank: u32 = 0,
     limit_s: f64 = 300, // TF_DSV41_STALL_S: first report; 0 = no report
     exit_s: f64 = 0, // TF_DSV41_STALL_EXIT_S: exit 70; 0 = never
     poll_ns: u64 = std.time.ns_per_s,
+    /// The names the report and the exit line quote. A follower's watch runs on the peer-wait knob, not the stall
+    /// pair, and a report that names the wrong knob sends the operator to the wrong setting.
+    limit_knob: []const u8 = "TF_DSV41_STALL_S",
+    exit_knob: []const u8 = "TF_DSV41_STALL_EXIT_S",
 
     pub const off: Settings = .{ .limit_s = 0, .exit_s = 0 };
 
     pub fn on(s: Settings) bool {
         return s.limit_s > 0 or s.exit_s > 0;
+    }
+};
+
+/// One allowance, in one place: a base of seconds widened by a prompt's worth of prefill at `prefill_tps`. The
+/// engine's round clock, the pair's peer-wait clock and `/health`'s null gap all weigh a silence against this
+/// number, so a long prefill's legitimacy cannot drift between the three of them (`/health` summed it inline at
+/// server/spark.zig until the sum moved here). Pure: no environment, no clock, no allocation.
+pub const Allowance = struct {
+    /// The seconds this wait gets before any prompt counts: `STALL_ROUND_S` for `/health`'s null gap, `PEER_WAIT_S`
+    /// for the peer clock. Zero is the caller's "off": `on` says it, and the bound is then nothing.
+    base_s: f64 = 0,
+    /// `STALL_PREFILL_TPS`: prompt rows a second. Zero widens nothing: a prompt is then no excuse for silence at all.
+    prefill_tps: f64 = 0,
+
+    pub fn on(a: Allowance) bool {
+        return a.base_s > 0;
+    }
+
+    /// The seconds a silence may run on a round carrying `prompt_rows` of prompt (0 for a decode round: the base).
+    pub fn seconds(a: Allowance, prompt_rows: f64) f64 {
+        return a.base_s + if (a.prefill_tps > 0) prompt_rows / a.prefill_tps else 0;
+    }
+
+    /// The same allowance for a clock that counts nanoseconds. Rounded to the nearest ns, not truncated: a bound is
+    /// compared at nanosecond resolution, and one that came back a fraction short would report a hair early.
+    pub fn nanos(a: Allowance, prompt_rows: u64) u64 {
+        const ns = a.seconds(@floatFromInt(prompt_rows)) * std.time.ns_per_s + 0.5;
+        if (!(ns > 0)) return 0; // also the NaN guard: a knob that parsed to nothing
+        if (ns >= @as(f64, @floatFromInt(std.math.maxInt(u64)))) return std.math.maxInt(u64);
+        return @intFromFloat(ns);
     }
 };
 
@@ -32,6 +67,7 @@ pub const Watch = struct {
     settings: Settings,
     sink: Sink = .{},
     exit_fn: *const fn (u8) void = exitNow, // fate.zig's seam: tests replace it (it may return there)
+    exit_hook: ?ExitHook = null, // a ctx seam run instead of it: the pair routes its exit through the peer layer
     thread: ?std.Thread = null,
     stop: std.atomic.Value(bool) = .init(false), // closer writes
     exited: std.atomic.Value(bool) = .init(false), // watch thread writes
@@ -47,6 +83,10 @@ pub const Watch = struct {
     finals: std.atomic.Value(u32) = .init(0),
     seen_round: u64 = std.math.maxInt(u64), // watch thread only
     last_report: u64 = 0, // watch thread only
+
+    /// A ctx seam run in place of `exit_fn` when a round passes the exit knob: the serving pair routes the exit
+    /// through its peer layer, so the other rank hears the reason and not only a socket close.
+    pub const ExitHook = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, code: u8) void };
 
     pub fn init(io: std.Io, settings: Settings) Watch {
         return .{ .io = io, .settings = settings };
@@ -135,7 +175,7 @@ pub const Watch = struct {
         }
         w.exitLine(now, rnd, t_round);
         w.exited.store(true, .release);
-        w.exit_fn(exit_code);
+        if (w.exit_hook) |h| h.run(h.ctx, exit_code) else w.exit_fn(exit_code);
         return true;
     }
 
@@ -150,12 +190,13 @@ pub const Watch = struct {
         const p: Phase = @fromBackingInt(@intCast(w.current.load(.acquire)));
         const t_phase = w.t_phase.load(.acquire);
         var buf: [512]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} has run {d:.1} s (phase '{s}' for {d:.1} s; TF_DSV41_STALL_S={d})\n  host: {d} running, {d} waiting; plan {d} pieces, {d} finals\n", .{
+        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} has run {d:.1} s (phase '{s}' for {d:.1} s; {s}={d})\n  host: {d} running, {d} waiting; plan {d} pieces, {d} finals\n", .{
             w.settings.rank,
             rnd,
             nsToSeconds(now -| t_round),
             @tagName(p),
             nsToSeconds(now -| t_phase),
+            w.settings.limit_knob,
             w.settings.limit_s,
             w.running.load(.acquire),
             w.waiting.load(.acquire),
@@ -168,10 +209,11 @@ pub const Watch = struct {
 
     fn exitLine(w: *Watch, now: u64, rnd: u64, t_round: u64) void {
         var buf: [256]u8 = undefined;
-        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} ran {d:.0} s >= TF_DSV41_STALL_EXIT_S={d}: exiting ({d}) so the watchdog restarts both ranks\n", .{
+        const line = std.fmt.bufPrint(&buf, "[dsv41 stall] r{d}: round {d} ran {d:.0} s >= {s}={d}: exiting ({d}) so the watchdog restarts both ranks\n", .{
             w.settings.rank,
             rnd,
             nsToSeconds(now -| t_round),
+            w.settings.exit_knob,
             w.settings.exit_s,
             exit_code,
         }) catch return;
@@ -323,4 +365,63 @@ test "stall: a round that ends or changes during the report is not exited" {
     const tc = changed.t_round.load(.acquire);
     try std.testing.expect(!changed.tick(tc + 10 * s));
     try std.testing.expectEqual(@as(u8, 0), Exit.code);
+}
+
+test "stall: one allowance: the base, the prompt widening, and the nanoseconds a clock arms on" {
+    // `/health`'s null-gap number (OPERATIONS: 120 s plus 128k rows at 200 t/s = 760 s) is this formula, and the
+    // peer-wait clock arms the same one on its own knob
+    const gap = Allowance{ .base_s = 120, .prefill_tps = 200 };
+    try std.testing.expectEqual(@as(f64, 760), gap.seconds(128_000));
+    try std.testing.expectEqual(@as(f64, 120), gap.seconds(0)); // a round that admits nothing gets the base alone
+    try std.testing.expectEqual(@as(f64, 120), (Allowance{ .base_s = 120 }).seconds(128_000)); // no tps: no excuse
+    // a clock compares nanoseconds, and a bound written to the nanosecond has to come back that number: `nanos`
+    // rounds to the nearest, so the round trip through the knob's seconds costs no nanosecond
+    const tight = Allowance{ .base_s = 0.0000004, .prefill_tps = 200 };
+    try std.testing.expectEqual(@as(u64, 400), tight.nanos(0));
+    try std.testing.expectEqual(@as(u64, 400 + 5_000_000_000), tight.nanos(1_000));
+    try std.testing.expectEqual(@as(u64, 0), (Allowance{}).nanos(1_000_000)); // off is off, however many rows
+    try std.testing.expect(!(Allowance{}).on() and (Allowance{ .base_s = 600 }).on());
+    // a widening no deadline can hold still says so, instead of wrapping into a bound that fires at once
+    const unwieldy = Allowance{ .base_s = 600, .prefill_tps = 1e-12 };
+    try std.testing.expectEqual(std.math.maxInt(u64), unwieldy.nanos(1_000_000_000));
+}
+
+test "stall: the exit the pair names: an exit hook takes the exit in place of the bare one, and both lines quote the knob that won" {
+    const s: u64 = std.time.ns_per_s;
+    Exit.code = 0;
+    var cap: Cap = .{};
+    // the spellings this rank read (serve_engine names them; a report that named the other one would send the
+    // operator to a setting nobody set)
+    var w = Watch.init(std.testing.io, .{
+        .limit_s = 5,
+        .exit_s = 10,
+        .limit_knob = "GLM53_TF_STALL_S",
+        .exit_knob = "GLM53_TF_STALL_EXIT_S",
+    });
+    w.sink = .{ .ctx = &cap, .line = Cap.line };
+    w.exit_fn = Exit.record;
+    const Hook = struct {
+        n: u32 = 0,
+        code: u8 = 0,
+        fn run(ctx: *anyopaque, code: u8) void {
+            const h: *@This() = @ptrCast(@alignCast(ctx));
+            h.code = code;
+            h.n += 1;
+        }
+    };
+    var hook: Hook = .{};
+    w.exit_hook = .{ .ctx = &hook, .run = Hook.run };
+    w.begin(4, .plan_wait);
+    const t = w.t_round.load(.acquire);
+    try std.testing.expect(!w.tick(t + 4 * s)); // the report is not due, and neither is the exit
+    try std.testing.expect(!w.tick(t + 5 * s)); // the report went out; the exit did not happen
+    try std.testing.expect(std.mem.indexOf(u8, cap.text[0..cap.len], "GLM53_TF_STALL_S=5") != null);
+    try std.testing.expectEqual(@as(u32, 0), hook.n);
+    try std.testing.expect(w.tick(t + 10 * s));
+    // the hook's route ran, and the bare `_exit` did not: this is how rank 0's exit reaches Fate with the reason
+    try std.testing.expectEqual(@as(u32, 1), hook.n);
+    try std.testing.expectEqual(exit_code, hook.code);
+    try std.testing.expectEqual(@as(u8, 0), Exit.code);
+    try std.testing.expect(w.exited.load(.acquire)); // and the watch thread stops on this tick's true
+    try std.testing.expect(std.mem.indexOf(u8, cap.text[0..cap.len], "GLM53_TF_STALL_EXIT_S=10") != null);
 }

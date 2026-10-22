@@ -241,6 +241,15 @@ pub const PeerSource = struct {
     read: *const fn (ctx: ?*anyopaque, out: *PeerProgress) bool,
 };
 
+/// The round bracket LaneHost stamps, one open and one close per round: the family seam sends the round's peer
+/// markers here (LaneHost never holds a Forward), and `rows` is what the round admitted, the allowance a waiting
+/// peer derives.
+pub const RoundHooks = struct {
+    ctx: *anyopaque,
+    begin: *const fn (ctx: *anyopaque, round_no: u64, rows: u64) void,
+    end: *const fn (ctx: *anyopaque) void,
+};
+
 pub const Status = struct {
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,
@@ -356,14 +365,16 @@ pub const prompt_imprint = @import("prompt_imprint.zig");
 /// The idle keepalive's ticker and target contract.
 pub const keepalive = @import("keepalive.zig");
 
-/// A round's stall clock, its report and its exit (stall.zig).
-pub const stall = @import("stall.zig");
+/// A round's stall clock, its report and its exit (the `stall` module, zig/src/core/stall.zig): the same module `tp`
+/// arms its peer-wait clock with, so one `Allowance` is the bound both ranks quote.
+pub const stall = @import("stall");
 
 test {
     _ = @import("lane_host.zig");
     _ = @import("lane_host_reuse_test.zig");
+    _ = @import("lane_host_peer_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_imprint.zig");
     _ = @import("keepalive.zig");
-    _ = @import("stall.zig");
+    _ = @import("stall");
 }

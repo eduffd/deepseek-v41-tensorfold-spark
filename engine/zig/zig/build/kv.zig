@@ -1,6 +1,7 @@
 //! KV memory's build: the family-neutral `sessions` module (zig/src/sessions) and DeepSeek-V4.1's `kv` module over it, with host tests on any OS.
 
 const std = @import("std");
+const stall_build = @import("stall.zig");
 
 /// The CUDA runtime without the engine's kernels (kv needs the driver, memory and streams; tp's collectives need the same).
 fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
@@ -25,11 +26,13 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     return m;
 }
 
-pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step, tp_module: fn (*std.Build, std.Build.ResolvedTarget, std.builtin.OptimizeMode, *std.Build.Module) *std.Build.Module) void {
+/// `tp_module` builds a `tp` module over a runtime and that binary's `stall` module (zig/build/stall.zig), so KV's test
+/// binaries carry the same allowance struct the pair's clocks arm on.
+pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, test_step: *std.Build.Step, tp_module: fn (*std.Build, std.Build.ResolvedTarget, std.builtin.OptimizeMode, *std.Build.Module, *std.Build.Module) *std.Build.Module) void {
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug);
     const s = b.addRunArtifact(b.addTest(.{ .root_module = sessions(b, host, .debug) }));
-    const k = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, tp_module(b, host, .debug, cuda)) }));
+    const k = b.addRunArtifact(b.addTest(.{ .root_module = module(b, host, .debug, cuda, tp_module(b, host, .debug, cuda, stall_build.module(b, host, .debug))) }));
     const step = b.step("test-kv", "KV memory's host tests: pool, sessions, NVMe tier on real files, split KV on in-process ranks (no GPU)");
     step.dependOn(&s.step);
     step.dependOn(&k.step);
@@ -49,7 +52,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     const sg = b.createModule(.{ .root_source_file = b.path("zig/src/families/deepseek_v41/kv/split_gpu.zig"), .target = target, .optimize = optimize, .link_libc = true });
     sg.addImport("sessions", sessions(b, target, optimize));
     sg.addImport("cuda", rt);
-    sg.addImport("tp", tp_module(b, target, optimize, rt));
+    sg.addImport("tp", tp_module(b, target, optimize, rt, stall_build.module(b, target, optimize)));
     const sexe = b.addExecutable(.{ .name = "tf-kv-split-test", .root_module = sg });
     b.step("tf-kv-split-test", "Split KV's exchange on two GPUs (one process a rank): dense, graph replays, unions vs the replicated rows").dependOn(&b.addInstallArtifact(sexe, .{}).step);
 }

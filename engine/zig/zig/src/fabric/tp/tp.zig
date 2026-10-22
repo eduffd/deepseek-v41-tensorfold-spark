@@ -8,6 +8,7 @@ pub const config = @import("config.zig");
 pub const sock = @import("sock.zig");
 pub const bootstrap = @import("bootstrap.zig");
 pub const fate = @import("fate.zig");
+pub const peerwait = @import("peerwait.zig");
 pub const host = @import("host.zig");
 pub const nccl = @import("nccl.zig");
 pub const mailbox = @import("mailbox.zig");
@@ -34,6 +35,8 @@ pub const Session = struct {
     /// The round plan's link (rank 0 sends, the others receive), on its own TCP connection.
     plan: planlink.PlanLink = undefined,
     fate: ?Fate = null,
+    /// The peer-wait clock (peerwait.zig): armed inside a round, disarmed at its boundary, off with the knob at 0.
+    peer: peerwait.Clock = .{},
     /// The fate thread's frozen watch: the last sample's counters, and when they last moved. ONE writer: the
     /// fate thread calls `progress` once per report period; the frozen bookkeeping mutates state, so no other
     /// thread calls it.
@@ -81,6 +84,29 @@ pub const Session = struct {
             if (cfg.rank == 0) s.fate.?.setLeaderProgress(.{ .ctx = s, .read = leaderSent });
             try s.fate.?.start();
         }
+        // TF_DSV41_PEER_WAIT_S: the clock beside the fate thread; at 0 it spawns no thread and the plan link's
+        // deadline source hands out null forever, which is the path this tree had before
+        s.peer = peerwait.Clock{
+            .settings = .{
+                .rank = cfg.rank,
+                // the allowance is the knob's own unit (seconds) plus the rows/prefill-tps widening; the clock asks it
+                // for nanoseconds. The config carries the knob in ns (its boot guard compares it against the mailbox
+                // timeout in ns), so this is the one place the two units meet.
+                .allowance = .{
+                    .base_s = @as(f64, @floatFromInt(cfg.peer_wait_ns)) / 1e9,
+                    .prefill_tps = cfg.prefill_tps,
+                },
+            },
+            .progress = fate.ProgressSource{ .ctx = s, .read = peerProgress },
+        };
+        if (s.fate) |*f| s.peer.fate = f;
+        // the proxy bounds the posts it has outstanding against the mailbox knob and names an expiry through this
+        // clock (roce.zig's in-flight bound). Wired here, once the clock is built: the proxy thread has been running
+        // since `openRoce`, so a pointer handed out earlier would be a half-filled clock it could read.
+        if (s.roce) |r| r.peer = &s.peer;
+        s.plan.deadline_src = .{ .ctx = s, .call = peerDeadline };
+        s.plan.on_deadline = .{ .ctx = s, .call = peerDeadlineFired };
+        try s.peer.start();
         std.log.info("[tensorfold] tp: rank {d} of {d} up ({t}, NCCL {d}, fail-fast {s}, roce fast {s}: {d} poller(s), stagger {d} ns)", .{ cfg.rank, cfg.world, s.comm().kind(), v, if (cfg.failfast) "on" else "off", if (cfg.roce_fast & 1 != 0) "on" else "off", (cfg.roce_fast >> 8) & 0xff, cfg.roce_fast >> 16 });
     }
 
@@ -189,7 +215,9 @@ pub const Session = struct {
     /// This rank's transport progress: every word is an atomic host load, so it touches no GPU call, no lock
     /// and no allocation (the sampler's contract). `at`: this rank's monotonic clock at the send. Counters are
     /// cumulative since this rank's boot. One writer — the fate thread, once per report period.
-    pub fn progress(s: *Session, at: u64) fate.Progress {
+    /// This rank's counters, pure: every word an atomic host load, no GPU call, no lock, no allocation. Two threads
+    /// read it (the fate reporter on its report cadence, the peer-wait clock on its poll); nothing here mutates.
+    fn counters(s: *Session) fate.Progress {
         var p: fate.Progress = .{
             .transport = s.comm().kind(),
             .plans = s.plan.received.load(.acquire),
@@ -218,6 +246,11 @@ pub const Session = struct {
                 p.waited_us = x.waited_us;
             }
         }
+        return p;
+    }
+
+    pub fn progress(s: *Session, at: u64) fate.Progress {
+        var p = s.counters();
         if (s.last_sample) |l| {
             p.report_seq = l.report_seq + 1;
             const moved = p.plans != l.plans or p.doorbell != l.doorbell or p.completed != l.completed or
@@ -244,6 +277,74 @@ pub const Session = struct {
         return s.plan.sent.load(.acquire);
     }
 
+    /// The peer-wait clock's sample of the same counters. `plans` is the role's own: a leader's progress is its
+    /// sends, so its clock never counts the silence of a read it is not making.
+    fn peerProgress(ctx: *anyopaque, out: *fate.Progress) void {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        out.* = s.counters();
+        if (s.cfg.rank == 0) out.plans = s.plan.sent.load(.acquire);
+    }
+
+    /// The plan link asks for a deadline once per read and once per send; outside a round, or off the knob, this is
+    /// null: the wait is forever, as it was before this layer.
+    fn peerDeadline(ctx: *anyopaque) ?u64 {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        return s.peer.deadline();
+    }
+
+    /// A plan wait expired: the link named it, and the clock takes the pair down once (idempotent).
+    fn peerDeadlineFired(ctx: *anyopaque, cause: peerwait.Cause) void {
+        const s: *Session = @ptrCast(@alignCast(ctx));
+        _ = s.peer.expire(cause);
+    }
+
+    pub fn peerOn(s: *Session) bool {
+        return s.cfg.peer_wait_ns > 0;
+    }
+
+    /// The round bracket, on the host's stamps (rank 0) or the leader's markers (the followers): the clock counts
+    /// silence only inside a round, so an idle pair never ages toward an expiry.
+    pub fn peerRoundBegin(s: *Session, round_no: u64) void {
+        s.peer.beginRound(round_no);
+    }
+
+    pub fn peerRoundEnd(s: *Session) void {
+        s.peer.endRound();
+    }
+
+    /// What the round admitted: an admitted prompt is legitimate in-round work, so it widens the bound.
+    pub fn peerRows(s: *Session, rows: u64) void {
+        s.peer.setRows(rows);
+    }
+
+    pub fn peerPhase(s: *Session, p: peerwait.Phase) void {
+        s.peer.setPhase(p);
+    }
+
+    /// A follower's round watch giving up on a round the leader opened and never closed: this rank's own witness,
+    /// named with the round its markers carry. The silence clock's `armed` gate does not apply here: the watch's
+    /// evidence stands by itself.
+    /// True when this call is the one that named the exit; false when an expiry was already underway, whose own caller
+    /// ends the process. Rank 0's stall-exit reroute reads that (the watch's exit knob is not a silence the clock
+    /// counts, so the watch is the witness, and the exit must be named exactly once).
+    pub fn peerRoundWatchExit(s: *Session) bool {
+        return s.peer.fault(.{ .round_watch = .{ .rank = s.cfg.rank, .round = s.peer.round_no.load(.acquire) } });
+    }
+
+    /// One transport poll per round, both ranks at the same lockstep position (rank 0 at the round's close stamp,
+    /// rank 1 at its `round_close` marker): `check` asks the small transport and NCCL for a fault this rank has
+    /// already recorded but is not sitting in a wait for (an NCCL async error, a proxy failure, an aborted wait), and
+    /// a recorded one becomes the named expiry instead of a fault nobody reads. Host-local calls only, so the two
+    /// ranks' polls cannot pair up into a collective; off the knob, nothing happens.
+    pub fn checkRound(s: *Session) void {
+        if (!s.peerOn()) return;
+        s.comm().check() catch |e| {
+            _ = s.peer.fault(.{
+                .transport_fault = .{ .rank = s.cfg.rank, .round = s.peer.round_no.load(.acquire), .fault = @errorName(e) },
+            });
+        };
+    }
+
     /// This rank failed inside a round: every rank goes down (exit 70). Without fail-fast it only aborts.
     pub fn fatal(s: *Session, where: []const u8, err: anyerror) void {
         if (s.fate) |*f| return f.fatal(where, err);
@@ -268,6 +369,7 @@ pub const Session = struct {
     pub fn close(s: *Session) void {
         // a failed transport: every rank goes down (the peers stop posting) before this one lets go of anything
         if (s.roce) |r| if (r.failed()) if (s.fate) |*f| f.fatal("transport", error.BackendFailed);
+        s.peer.close(); // the clock thread reads the plan counters: joined before the link and the fate channel go
         if (s.fate) |*f| f.close();
         s.plan.close();
         if (s.roce) |r| r.deinit();
@@ -290,4 +392,6 @@ test {
     _ = @import("roce_inflight_test.zig");
     _ = @import("host_test.zig");
     _ = @import("fate_test.zig");
+    _ = @import("peerwait_test.zig");
+    _ = @import("planlink_stall_test.zig");
 }
