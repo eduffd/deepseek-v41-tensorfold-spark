@@ -7,6 +7,9 @@ const fate = @import("fate.zig");
 
 pub const knob = "TF_DSV41_PEER_WAIT_S";
 pub const alias_knob = "GLM53_TF_PEER_WAIT_S";
+/// The knob the proxy's in-flight bound takes its length from (roce.zig): a report that names the peer wait for a
+/// transport's own timeout sends the operator to the wrong setting, so the wait site names the one it runs on.
+pub const mailbox_knob = "TF_TP_MAILBOX_TIMEOUT_S";
 
 /// Why a rank gave up waiting. One variant per wait site; the sentence a variant renders is the named line the
 /// detecting rank prints and the reason the FAIL frame carries, verbatim.
@@ -24,14 +27,16 @@ pub const Cause = union(enum) {
             .plan_recv => |p| std.fmt.bufPrint(buf, "plan read: rank {d} saw no progress on round {d} for {d} ms past {s} (frames read {d})", .{ p.rank, p.round, ms(p.allow_s), knob, p.received }),
             .plan_send => |p| std.fmt.bufPrint(buf, "plan send: rank {d} had a peer stop reading round {d}'s plan for {d} ms past {s} (plans sent {d})", .{ p.rank, p.round, ms(p.allow_s), knob, p.sent }),
             .device_wait => |p| std.fmt.bufPrint(buf, "device wait: rank {d} round {d} stayed in {s} for {d} ms past {s}", .{ p.rank, p.round, p.what, ms(p.allow_s), knob }),
-            .proxy_inflight => |p| std.fmt.bufPrint(buf, "proxy in flight: rank {d} round {d}'s {s} never completed for {d} ms past {s}", .{ p.rank, p.round, p.why, ms(p.allow_s), knob }),
+            .proxy_inflight => |p| std.fmt.bufPrint(buf, "proxy in flight: rank {d} round {d}'s {s} never completed for {d} ms past {s}", .{ p.rank, p.round, p.why, ms(p.allow_s), mailbox_knob }),
             .transport_fault => |p| std.fmt.bufPrint(buf, "transport fault: rank {d} round {d}: {s} past {s}", .{ p.rank, p.round, p.fault, knob }),
             .round_watch => |p| std.fmt.bufPrint(buf, "round watch: rank {d} round {d} open {d} ms past {s}", .{ p.rank, p.round, ms(p.allow_s), knob }),
         };
     }
 
     /// A wait site knows its rank and its counters; the round and the allowance belong to the clock, and a zero
-    /// means "fill me from yours".
+    /// means "fill me from yours". A site that runs on a bound of its own (the proxy's, off the mailbox knob) names
+    /// its allowance here, and the clock leaves it alone. Rank is filled only when the site left it unset, and the
+    /// clock's rank is its own rank, so rank 0 keeps its name: the leader is the rank that sends the plan.
     pub fn fill(c: *Cause, rank: u32, round: u64, allow_s: f64) void {
         switch (c.*) {
             inline else => |*p| {

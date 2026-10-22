@@ -95,6 +95,10 @@ pub const Session = struct {
             .progress = fate.ProgressSource{ .ctx = s, .read = peerProgress },
         };
         if (s.fate) |*f| s.peer.fate = f;
+        // the proxy bounds the posts it has outstanding against the mailbox knob and names an expiry through this
+        // clock (roce.zig's in-flight bound). Wired here, once the clock is built: the proxy thread has been running
+        // since `openRoce`, so a pointer handed out earlier would be a half-filled clock it could read.
+        if (s.roce) |r| r.peer = &s.peer;
         s.plan.deadline_src = .{ .ctx = s, .call = peerDeadline };
         s.plan.on_deadline = .{ .ctx = s, .call = peerDeadlineFired };
         try s.peer.start();
@@ -317,6 +321,20 @@ pub const Session = struct {
     /// evidence stands by itself.
     pub fn peerRoundWatchExit(s: *Session) void {
         _ = s.peer.fault(.{ .round_watch = .{ .rank = s.cfg.rank, .round = s.peer.round_no.load(.acquire) } });
+    }
+
+    /// One transport poll per round, both ranks at the same lockstep position (rank 0 at the round's close stamp,
+    /// rank 1 at its `round_close` marker): `check` asks the small transport and NCCL for a fault this rank has
+    /// already recorded but is not sitting in a wait for (an NCCL async error, a proxy failure, an aborted wait), and
+    /// a recorded one becomes the named expiry instead of a fault nobody reads. Host-local calls only, so the two
+    /// ranks' polls cannot pair up into a collective; off the knob, nothing happens.
+    pub fn checkRound(s: *Session) void {
+        if (!s.peerOn()) return;
+        s.comm().check() catch |e| {
+            _ = s.peer.fault(.{
+                .transport_fault = .{ .rank = s.cfg.rank, .round = s.peer.round_no.load(.acquire), .fault = @errorName(e) },
+            });
+        };
     }
 
     /// This rank failed inside a round: every rank goes down (exit 70). Without fail-fast it only aborts.

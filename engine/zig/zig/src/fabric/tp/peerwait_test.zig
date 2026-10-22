@@ -249,3 +249,38 @@ test "one expiry prints one named line, the FAIL frame carries its reason, and a
     try std.testing.expect(std.mem.indexOf(u8, r0, "round 12") != null);
     try std.testing.expect(std.mem.indexOf(u8, r0, "PeerStalled") != null);
 }
+
+test "each wait site's sentence names the site, the rank that waits, the knob its bound runs on, and the counters it watched" {
+    const Site = struct { rank: u32, c: peerwait.Cause, want: []const []const u8 };
+    // every variant the layer can expire on, as its wait site builds it: the comptime check in peerwait.zig only
+    // proves the fields exist, so the sentences are pinned here, one row per site. A row states what its site states
+    // (its counters, and its own bound where the bound is not the clock's) and leaves the rest to `fill`, exactly as
+    // the clock's expiry path does. `rank` is the clock's rank, which is the site's rank: rank 0 is a rank and not
+    // "unset", and it is rank 0 that sends the plan, so that row proves the name survives the fill.
+    const sites = [_]Site{
+        .{ .rank = 1, .c = .{ .plan_recv = .{ .received = 4 } }, .want = &.{ "plan read", "rank 1", "round 7", "for 300000 ms past", peerwait.knob, "frames read 4" } },
+        .{ .rank = 0, .c = .{ .plan_send = .{ .sent = 9 } }, .want = &.{ "plan send", "rank 0", "round 7", "for 300000 ms past", peerwait.knob, "plans sent 9" } },
+        .{ .rank = 1, .c = .{ .device_wait = .{ .what = "all-gather" } }, .want = &.{ "device wait", "rank 1", "round 7", "all-gather", "for 300000 ms past", peerwait.knob } },
+        // the proxy's bound is the mailbox timeout: its site names that length itself, so the clock's allowance must
+        // not overwrite it, and the line quotes that knob and not the peer wait
+        .{ .rank = 0, .c = .{ .proxy_inflight = .{ .allow_s = 120, .why = "posted write" } }, .want = &.{ "proxy in flight", "rank 0", "round 7", "posted write", "for 120000 ms past", peerwait.mailbox_knob } },
+        // the round boundary's poll: the error the transport recorded, by name
+        .{ .rank = 1, .c = .{ .transport_fault = .{ .fault = @errorName(error.PeerFailed) } }, .want = &.{ "transport fault", "rank 1", "round 7", "PeerFailed", peerwait.knob } },
+        .{ .rank = 1, .c = .{ .round_watch = .{} }, .want = &.{ "round watch", "rank 1", "round 7", "open 300000 ms past", peerwait.knob } },
+    };
+    for (sites) |s| {
+        var c = s.c;
+        c.fill(s.rank, 7, 300); // the clock fills the round and the bound it runs on
+        var buf: [448]u8 = undefined;
+        const line = c.format(&buf) catch |e| {
+            std.debug.print("{s}: {t}\n", .{ @tagName(c), e });
+            return error.TestUnexpectedResult;
+        };
+        for (s.want) |want| {
+            if (std.mem.indexOf(u8, line, want) == null) {
+                std.debug.print("{s}\n  missing '{s}'\n", .{ line, want });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}

@@ -751,6 +751,9 @@ pub const Forward = struct {
     /// close it on the stream.
     pub fn roundClose(f: *Forward) void {
         const s = f.tp_session orelse return;
+        // the round's transport poll, taken before the clock stands down: a fault the device recorded during this
+        // round (an async NCCL error, a proxy failure) ends the pair by name here instead of waiting for a wait
+        s.checkRound();
         s.peerRoundEnd();
         f.link.?.sendRoundClose() catch |e| std.log.scoped(.dsv41).warn("rank 0: round {d} close frame refused ({t})", .{ s.peer.round_no.load(.acquire), e });
     }
@@ -805,7 +808,12 @@ pub const Forward = struct {
                 if (f.watch) |w| w.begin(rn, .plan_wait);
             },
             tp.planlink.op_round_close => {
-                if (f.tp_session) |s| s.peerRoundEnd();
+                // the same transport poll at the same position in the round as on the leader, and while the marker's
+                // round is still the one a fault would name
+                if (f.tp_session) |s| {
+                    s.checkRound();
+                    s.peerRoundEnd();
+                }
                 if (f.watch) |w| w.end();
             },
             op_window => {
