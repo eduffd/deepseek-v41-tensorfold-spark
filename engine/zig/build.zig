@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const cuda_build = @import("zig/build/cuda.zig");
 const server_build = @import("zig/build/server.zig");
 const tp_build = @import("zig/build/tp.zig");
+const stall_build = @import("zig/build/stall.zig");
 const kv_build = @import("zig/build/kv.zig");
 const sampling_build = @import("zig/build/sampling.zig");
 const grammar_build = @import("zig/build/grammar.zig");
@@ -147,6 +148,7 @@ pub fn build(b: *std.Build) void {
     tp_build.add(b, target, optimize, test_step);
     kv_build.add(b, target, optimize, test_step, tp_build.module);
     sampling_build.add(b, test_step);
+    stall_build.add(b, test_step); // the module's own tests: a module is only tested where it is a root
     grammar_build.add(b, test_step);
     vision_build.add(b, test_step);
 }
@@ -275,7 +277,7 @@ fn metalTargets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
     const kernels_mod = embedded(b, lib, "tensorfold.metallib");
 
     // The engines registry: the families this platform's binaries serve; the CLI reads it for models/info/pull.
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = mods.lanes }} });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = mods.lanes }, .{ .name = "stall", .module = stall_build.module(b, target, optimize) } } });
     const engines = b.createModule(.{
         .root_source_file = b.path("zig/src/native/metal.zig"),
         .target = target,
@@ -544,7 +546,7 @@ pub fn distMetalServer(b: *std.Build, target: std.Build.ResolvedTarget, draft_id
     m.metal.addSystemFrameworkPath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "System/Library/Frameworks" })));
     m.metal.addLibraryPath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "usr/lib" })));
     m.metal.addSystemIncludePath(b.graph.cwdRelativePath(b.pathJoin(&.{ sdk, "usr/include" })));
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .fast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = m.lanes }} });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = .fast, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = m.lanes }, .{ .name = "stall", .module = stall_build.module(b, target, .fast) } } });
     const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/metal.zig"), .target = target, .optimize = .fast, .link_libc = true, .imports = &.{ .{ .name = "metal", .module = m.metal }, .{ .name = "engine_api", .module = api }, .{ .name = "tensorfold", .module = m.engine } } });
     return nativeServer(b, target, .fast, m.metal, m.engine, api, engines, build_options, null);
 }

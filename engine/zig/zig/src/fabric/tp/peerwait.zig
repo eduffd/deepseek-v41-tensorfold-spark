@@ -4,6 +4,9 @@
 const std = @import("std");
 const sock = @import("sock.zig");
 const fate = @import("fate.zig");
+// the pair's one allowance formula, shared with `/health`'s null gap (core/stall.zig): the bound this clock arms is
+// that formula on the peer-wait knob, so a prompt's worth of legitimacy cannot drift between the two verdicts
+const stall = @import("stall");
 
 pub const knob = "TF_DSV41_PEER_WAIT_S";
 pub const alias_knob = "GLM53_TF_PEER_WAIT_S";
@@ -75,11 +78,14 @@ pub const Phase = enum(u8) { plan_recv, plan_send, device, proxy };
 
 pub const Settings = struct {
     rank: u32 = 0,
-    /// TF_DSV41_PEER_WAIT_S in ns: the silence bound. Zero turns the layer off entirely: no deadline, no thread.
-    silence_ns: u64 = 0,
-    /// rows / GLM53_TF_STALL_PREFILL_TPS widens the bound: an admitted prompt is legitimate in-round work.
-    prefill_ns_per_row: u64 = 0,
+    /// The bound's base is TF_DSV41_PEER_WAIT_S, widened by the round's rows at GLM53_TF_STALL_PREFILL_TPS: the same
+    /// `stall.Allowance` `/health`'s null gap reads. A base of 0 turns the layer off entirely: no deadline, no thread.
+    allowance: stall.Allowance = .{},
     poll_ns: u64 = std.time.ns_per_s,
+
+    pub fn on(s: Settings) bool {
+        return s.allowance.on();
+    }
 };
 
 /// The report line goes through the sink: the session wires the log, tests record what was said.
@@ -119,13 +125,15 @@ pub const Clock = struct {
     last: fate.Progress = .{ .transport = .host },
     have_last: bool = false,
 
+    /// This round's bound: the allowance on the rows the round admitted (0 for a round that admits nothing), as the
+    /// one formula counts them.
     pub fn boundNs(c: *const Clock) u64 {
-        return c.settings.silence_ns + c.rows.load(.monotonic) *| c.settings.prefill_ns_per_row;
+        return c.settings.allowance.nanos(c.rows.load(.monotonic));
     }
 
     /// The next wait's absolute deadline: null off, outside a round, or already expired. A null is HEAD's path.
     pub fn deadline(c: *Clock) ?u64 {
-        if (c.settings.silence_ns == 0 or !c.armed.load(.acquire) or c.expired()) return null;
+        if (!c.settings.on() or !c.armed.load(.acquire) or c.expired()) return null;
         return c.moved_at.load(.monotonic) + c.boundNs();
     }
 
@@ -157,7 +165,7 @@ pub const Clock = struct {
     }
 
     pub fn start(c: *Clock) !void {
-        if (c.settings.silence_ns == 0) return;
+        if (!c.settings.on()) return;
         c.thread = try std.Thread.spawn(.{}, loop, .{c});
     }
 
@@ -179,7 +187,7 @@ pub const Clock = struct {
     /// One clock-thread pass: counter movement restarts the silence, a quarter of the bound reports, every bound
     /// after reports again, and silence past the bound expires. True when this call was the expiry.
     pub fn tick(c: *Clock) bool {
-        if (c.settings.silence_ns == 0 or !c.armed.load(.acquire) or c.expired()) return false;
+        if (!c.settings.on() or !c.armed.load(.acquire) or c.expired()) return false;
         const t = c.now();
         if (c.progress) |src| {
             var p: fate.Progress = .{ .transport = .host };
@@ -221,7 +229,7 @@ pub const Clock = struct {
     /// The one expiry: the named line first, then the pair comes down. A round that closed inside its own report
     /// line is not expired: the clock re-checks `armed` after the line, the way stall.zig's watch does.
     pub fn expire(c: *Clock, cause0: Cause) bool {
-        if (c.settings.silence_ns == 0) return false;
+        if (!c.settings.on()) return false;
         if (c.expired_flag.swap(true, .acq_rel)) return false;
         var sbuf: [448]u8 = undefined;
         const sentence = c.speak(cause0, &sbuf);
@@ -236,7 +244,7 @@ pub const Clock = struct {
     /// An expiry a witness saw from outside the silence (a follower's round watch, a proxy's in-flight bound): the
     /// same one latch and the same named line, no `armed` gate: the witness stands on its own evidence.
     pub fn fault(c: *Clock, cause0: Cause) bool {
-        if (c.settings.silence_ns == 0) return false;
+        if (!c.settings.on()) return false;
         if (c.expired_flag.swap(true, .acq_rel)) return false;
         var sbuf: [448]u8 = undefined;
         c.down(c.speak(cause0, &sbuf));

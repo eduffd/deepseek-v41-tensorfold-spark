@@ -3,6 +3,7 @@
 //! directory) and TF_DSV41_GOLDEN (zig/tests/server/dsv41/gen_*.py's output directory).
 const std = @import("std");
 const vision_build = @import("vision.zig");
+const stall_build = @import("stall.zig");
 
 /// DeepSeek-V4.1's serving module (tokenizer, encoding, DSML tools, sampling) over the modules the server shares.
 pub fn serveModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, json: *std.Build.Module, tokenizer: *std.Build.Module, lanes: *std.Build.Module) *std.Build.Module {
@@ -24,13 +25,15 @@ pub fn serveModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
 
 const Server = struct { json: *std.Build.Module, serve: *std.Build.Module, server: *std.Build.Module, api: *std.Build.Module };
 
-/// The server module (zig/src/server/root.zig) and everything it imports, for ``target``.
-fn server(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, root: []const u8, natives: ?*std.Build.Module, build_options: *std.Build.Step.Options) Server {
+/// The server module (zig/src/server/root.zig) and everything it imports, for ``target``. ``stall`` is the binary's one
+/// stall module (zig/build/stall.zig): `engine_api` reaches it by name, and a binary whose engine also links `tp` hands
+/// that same module to zig/build/tp.zig - two modules over stall.zig in one binary is the link error.
+fn server(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, root: []const u8, natives: ?*std.Build.Module, build_options: *std.Build.Step.Options, stall: *std.Build.Module) Server {
     const json = b.createModule(.{ .root_source_file = b.path("zig/src/server/json.zig"), .target = target, .optimize = optimize });
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "stall", .module = stall } } });
     const serve = serveModule(b, target, optimize, json, tokenizer, lanes);
     const m = b.createModule(.{
         .root_source_file = b.path(root),
@@ -59,15 +62,15 @@ fn server(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin
 }
 
 /// tensorfold-native's root module with `natives` as its built-in engines (zig/build/cuda.zig: tensorfold-dsv41).
-pub fn withEngine(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, natives: *std.Build.Module, build_options: *std.Build.Step.Options) *std.Build.Module {
-    return server(b, target, optimize, "zig/src/server/main.zig", natives, build_options).server;
+pub fn withEngine(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, natives: *std.Build.Module, build_options: *std.Build.Step.Options, stall: *std.Build.Module) *std.Build.Module {
+    return server(b, target, optimize, "zig/src/server/main.zig", natives, build_options, stall).server;
 }
 
 /// `test-dsv41-serve`: the serving module's goldens; `test-server`: the HTTP server's tests (DeepSeek over HTTP
 /// included); both part of `test`. `tf-dsv41-tokbench`: throughput. `server-none`: tensorfold-native without an engine.
 pub fn tests(b: *std.Build, build_options: *std.Build.Step.Options, test_step: *std.Build.Step) void {
     const host = b.graph.host;
-    const s = server(b, host, .Debug, "zig/src/server/root.zig", null, build_options);
+    const s = server(b, host, .Debug, "zig/src/server/root.zig", null, build_options, stall_build.module(b, host, .Debug));
     const serve_step = b.step("test-dsv41-serve", "DeepSeek-V4.1's serving side: tokenizer, encoding, DSML tools, sampling (goldens: TF_DSV41_MODEL, TF_DSV41_GOLDEN)");
     serve_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = s.serve })).step);
     test_step.dependOn(serve_step);
@@ -95,10 +98,10 @@ pub fn tests(b: *std.Build, build_options: *std.Build.Step.Options, test_step: *
         b.step("test-golden", "The frozen server parity goldens checked by a Zig step driving fake_serve").dependOn(&golden_run.step);
         test_step.dependOn(&golden_run.step);
         const none = b.createModule(.{ .root_source_file = b.path("zig/src/native/none.zig"), .target = host, .optimize = .ReleaseSafe, .link_libc = true });
-        const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = server(b, host, .ReleaseSafe, "zig/src/server/main.zig", none, build_options).server });
+        const exe = b.addExecutable(.{ .name = "tensorfold-native", .root_module = server(b, host, .ReleaseSafe, "zig/src/server/main.zig", none, build_options, stall_build.module(b, host, .ReleaseSafe)).server });
         b.step("server-none", "tensorfold-native without an engine (the server's own checks) into zig-out/server").dependOn(&b.addInstallArtifact(exe, .{ .dest_dir = .{ .override = .{ .custom = "server" } } }).step);
     }
-    const fast = server(b, host, .ReleaseFast, "zig/src/server/root.zig", null, build_options);
+    const fast = server(b, host, .ReleaseFast, "zig/src/server/root.zig", null, build_options, stall_build.module(b, host, .ReleaseFast));
     const bench = b.addExecutable(.{ .name = "tf-dsv41-tokbench", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/tests/server/dsv41/tokbench.zig"),
         .target = host,

@@ -109,10 +109,23 @@ Host memory and stalls (G12; defaults in brackets):
   ships its transport progress to rank 0 over the Fate channel, and `/health`'s `peer` section reports its age, freeze,
   outstanding plans and seconds since the pair last kept pace, with three peer gauges on `/metrics`. The peer data is
   export only. A frozen rank 1 beside an idle rank 0 stays a 200 with a growing `frozen_s`, and a peer-keyed verdict
-  ships in a later wave with a threshold measured from a pair. Peer waits
-  ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)) and the stale mailbox
-  ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) stay open
+  ships in a later wave with a threshold measured from a pair. The stale mailbox
+  ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)) stays open
   ([KNOWN-ISSUES](KNOWN-ISSUES.md)).
+- `TF_DSV41_PEER_WAIT_S` (0 = off; both shipped Zig profiles set 600; `GLM53_TF_PEER_WAIT_S` wins): the deadline on a
+  peer wait inside a round
+  ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2), fixed). Each rank runs one clock that counts
+  silence in its own transport counters, armed while a round is open and disarmed at its boundary, so an idle pair
+  never ages toward it. Its bound is the knob plus the round's admitted prompt at `GLM53_TF_STALL_PREFILL_TPS`: the
+  same allowance `/health`'s null-gap verdict uses, so a long prefill is never a stall here either. It covers the plan
+  link in both directions, this rank's device waits, the proxy's outstanding RDMA posts (those are bounded by
+  `TF_TP_MAILBOX_TIMEOUT_S`, and the engine refuses to boot with a peer wait below that order), and the follower's
+  round clock. Rank 1 arms inside rank 0's stamped windows on markers that ride the plan stream, so the plan link's
+  `outstanding` gauge counts two extra frames per round on top of its collectives. An expiry names the wait it expired
+  on: the report line quotes the knob the bound runs on and the bound's own length, the FAIL frame carries the same
+  sentence to the peer, and both ranks exit 70 for the watchdog to heal. Rank 0's stall exit is named through the same
+  layer, so the peer dies knowing the round rather than watching a socket close. The model is rank-local, so it holds
+  past TP=2; the tests and the pair run at two ranks.
 - `TF_DSV41_ENGRAM_WAIT_S` (300; 0 = none): deadline on an Engram read and on the Engram gate's worker.
 - `TF_DSV41_NUMPY_HUGEPAGE` (0): NumPy's huge-page request on its large buffers, off on the ranks.
 - `TF_DSV41_HOST_BUFFERS` (6): reused NumPy buffers for a prompt segment's Engram rows.

@@ -9,9 +9,9 @@ d="$root/zig/src/families/deepseek_v41"
   "-Mjson=$root/zig/src/server/json.zig" \
   --dep json --dep tokenizer --dep lanes --dep dsv41_serve_fixtures -lc "-Mdsv41_serve=$d/serve/root.zig" \
   "-Mdsv41_serve_fixtures=$d/fixtures/serve/fixtures.zig" \
-  --dep lanes "-Mengine_api=$root/zig/src/core/engine_api.zig" \
+  --dep lanes --dep stall "-Mengine_api=$root/zig/src/core/engine_api.zig" "-Mstall=$root/zig/src/core/stall.zig" \
   "-Mlanes=$root/zig/src/core/lanes/lanes.zig" \
   "-Mtokenizer=$root/zig/src/core/tokenizer/tokenizer.zig" \
   "-Mtemplate=$root/zig/src/core/template/template.zig" "$@"
-"$zig" test -lc --dep lanes "-Mroot=$root/zig/src/core/engine_api.zig" "-Mlanes=$root/zig/src/core/lanes/lanes.zig"
+"$zig" test -lc --dep lanes --dep stall "-Mroot=$root/zig/src/core/engine_api.zig" "-Mstall=$root/zig/src/core/stall.zig" "-Mlanes=$root/zig/src/core/lanes/lanes.zig"
 "$zig" test "$root/zig/src/server/json.zig"

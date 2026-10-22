@@ -12,8 +12,11 @@
   200 for 364 s at HEAD), and rank 1's transport progress rides the Fate channel into the `peer` section and
   `/metrics`, so a rank-1-side wedge is visible there as a growing `frozen_s` and outstanding plans. The wedge itself
   is the open half of #3, and a peer-keyed verdict waits on a measured threshold (OPERATIONS "Knobs").
-  Still open: no deadline on any peer
-  wait ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2)), and a mailbox timeout
+  A deadline now sits on every peer wait:
+  `TF_DSV41_PEER_WAIT_S` (600 in both shipped Zig profiles) arms one clock per rank inside a round, and the rank that
+  stops moving names the wait it was in, prints the knob and the bound, and exits 70 beside its peer
+  ([#2](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/2), fixed). The pair no longer waits forever on
+  the rank-1 side of that wedge; an idle pair stays armed off. Still open: a mailbox timeout
   that leaves stale buffers live
   ([#4](https://github.com/eduffd/deepseek-v41-tensorfold-spark/issues/4)). That day's recovery was a human: stop the
   pair, start it again, ready in 122 s, about 80 minutes after the pair went dead. The self-heal watchdog
