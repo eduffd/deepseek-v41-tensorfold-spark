@@ -283,7 +283,7 @@ test "the ABI matches verbs.h" {
     try t.expectEqual(if (sdk) 152 else 136, @sizeOf(Cq));
     try t.expectEqual(if (sdk) 352 else 336, @sizeOf(Context));
     try t.expectEqual(264, @offsetOf(Context, "cmd_fd"));
-    try t.expectEqual(52, @sizeOf(PortAttr));
+    try t.expectEqual(56, @sizeOf(PortAttr));
     try t.expectEqual(46, @offsetOf(PortAttr, "link_layer"));
     try t.expectEqual(232, @sizeOf(DeviceAttr));
     try t.expectEqual(80, @offsetOf(DeviceAttr, "max_mr_size"));
