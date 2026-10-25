@@ -262,9 +262,14 @@ pub const mask = struct {
     pub const dest_qpn = 1 << 20;
 };
 
-// Sizes and offsets the SDK's verbs.h gives on arm64 macOS, as tools/zig/verbs_layout.c prints them.
+// Sizes and offsets each target's own verbs.h gives: the macOS arm64 SDK, and the pair's glibc aarch64 on Linux.
 test "the ABI matches verbs.h" {
     const t = std.testing;
+    const builtin = @import("builtin");
+    // Qp, Cq and Context hold a pthread_mutex_t: 64 bytes in the SDK, 48 in the pair's glibc aarch64.
+    const measured = builtin.os.tag == .macos or (builtin.os.tag == .linux and builtin.cpu.arch == .aarch64);
+    if (!measured) return error.SkipZigTest;
+    const sdk = builtin.os.tag == .macos;
     try t.expectEqual(664, @sizeOf(Device));
     try t.expectEqual(24, @offsetOf(Device, "name"));
     try t.expectEqual(256, @sizeOf(ContextOps));
@@ -274,9 +279,9 @@ test "the ABI matches verbs.h" {
     try t.expectEqual(48, @sizeOf(Mr));
     try t.expectEqual(36, @offsetOf(Mr, "lkey"));
     try t.expectEqual(52, @offsetOf(Qp, "qp_num"));
-    try t.expectEqual(184, @sizeOf(Qp));
-    try t.expectEqual(152, @sizeOf(Cq));
-    try t.expectEqual(352, @sizeOf(Context));
+    try t.expectEqual(if (sdk) 184 else 168, @sizeOf(Qp));
+    try t.expectEqual(if (sdk) 152 else 136, @sizeOf(Cq));
+    try t.expectEqual(if (sdk) 352 else 336, @sizeOf(Context));
     try t.expectEqual(264, @offsetOf(Context, "cmd_fd"));
     try t.expectEqual(52, @sizeOf(PortAttr));
     try t.expectEqual(46, @offsetOf(PortAttr, "link_layer"));
