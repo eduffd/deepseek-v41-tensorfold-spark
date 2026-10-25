@@ -100,6 +100,7 @@ pub const PortAttr = extern struct {
     link_layer: u8,
     flags: u8,
     port_cap_flags2: u16,
+    active_speed_ex: u32 = 0,
 };
 
 pub const DeviceAttr = extern struct {
@@ -283,6 +284,7 @@ test "the ABI matches verbs.h" {
     try t.expectEqual(if (sdk) 152 else 136, @sizeOf(Cq));
     try t.expectEqual(if (sdk) 352 else 336, @sizeOf(Context));
     try t.expectEqual(264, @offsetOf(Context, "cmd_fd"));
+    // PortAttr carries rdma-core 50's trailing active_speed_ex, which the SDK's 52-byte header lacks; one shape serves both, as a provider fills at most its own struct.
     try t.expectEqual(56, @sizeOf(PortAttr));
     try t.expectEqual(46, @offsetOf(PortAttr, "link_layer"));
     try t.expectEqual(232, @sizeOf(DeviceAttr));
