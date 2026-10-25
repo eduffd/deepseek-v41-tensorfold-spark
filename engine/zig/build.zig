@@ -4,6 +4,7 @@ const cuda_build = @import("zig/build/cuda.zig");
 const server_build = @import("zig/build/server.zig");
 const tp_build = @import("zig/build/tp.zig");
 const stall_build = @import("zig/build/stall.zig");
+const verbs_build = @import("zig/build/verbs.zig");
 const kv_build = @import("zig/build/kv.zig");
 const sampling_build = @import("zig/build/sampling.zig");
 const grammar_build = @import("zig/build/grammar.zig");
@@ -149,6 +150,7 @@ pub fn build(b: *std.Build) void {
     kv_build.add(b, target, optimize, test_step, tp_build.module);
     sampling_build.add(b, test_step);
     stall_build.add(b, test_step); // the module's own tests: a module is only tested where it is a root
+    verbs_build.add(b, test_step);
     grammar_build.add(b, test_step);
     vision_build.add(b, test_step);
 }
